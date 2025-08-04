@@ -59,6 +59,7 @@ class MainActivity : AppCompatActivity() {
 
                 if (!isServerRunning) {
                     startProxy(port)
+                    startTestRTMPStream()
                 } else {
                     Log.w(TAG, "Server is already running")
                 }

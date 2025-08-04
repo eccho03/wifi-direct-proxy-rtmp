@@ -8,6 +8,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
@@ -84,6 +85,8 @@ class SocksProxyServer(private val port: Int) {
                 val input = clientSocket.getInputStream()
                 val output = clientSocket.getOutputStream()
 
+                val handshakeStart = System.currentTimeMillis()
+
                 // 1. SOCKS5 handshake
                 val handshakeHeader = ByteArray(2)
                 if (input.read(handshakeHeader) != 2 || handshakeHeader[0] != 0x05.toByte()) {
@@ -101,6 +104,10 @@ class SocksProxyServer(private val port: Int) {
                 // Reply: no authentication
                 output.write(byteArrayOf(0x05, 0x00))
                 output.flush()
+                val handshakeEnd = System.currentTimeMillis()
+                println("[$connectionId] Handshake took ${handshakeEnd - handshakeStart} ms")
+
+                val connectStart = System.currentTimeMillis()
 
                 // 2. SOCKS5 request
                 val reqHeader = ByteArray(4)
@@ -170,6 +177,11 @@ class SocksProxyServer(private val port: Int) {
                     output.flush()
                     cleanup(clientSocket)
                 }
+
+                val connectEnd = System.currentTimeMillis()
+                println("[$connectionId] Connect to $port took ${connectEnd - connectStart} ms")
+
+
             } catch (e: Exception) {
                 println("[$connectionId] Client handling error: ${e.message}")
                 cleanup(clientSocket)
@@ -252,6 +264,8 @@ class SocksProxyServer(private val port: Int) {
     private fun startRelay(clientSocket: Socket, targetSocket: Socket, connectionId: String, connectionKey: String) {
         // 개별 스코프로 릴레이 작업 격리
         val relayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val relayStart = System.currentTimeMillis()
+
 
         val clientToServerJob = relayScope.launch {
             try {
@@ -297,81 +311,51 @@ class SocksProxyServer(private val port: Int) {
                 cleanupConnection(clientSocket, targetSocket, connectionId, connectionKey)
             }
         }
+        val relayEnd = System.currentTimeMillis()
+        println("[$connectionId] Relay finished in ${relayEnd - relayStart} ms")
     }
 
     private suspend fun relayData(
-        from: java.io.InputStream,
-        to: java.io.OutputStream,
-        direction: String,
-        connectionId: String,
-        clientSocket: Socket,
-        targetSocket: Socket
+    from: InputStream,
+    to: OutputStream,
+    direction: String,
+    connectionId: String,
+    clientSocket: Socket,
+    targetSocket: Socket
     ) {
         withContext(Dispatchers.IO) {
             try {
-                val buffer = ByteArray(8192)
-                var totalBytes = 0L
-                var lastActivityTime = System.currentTimeMillis()
+                val idleTimeoutMillis = 5000L
+                var lastReadTime = System.currentTimeMillis()
 
+                val buffer = ByteArray(8192)
                 while (isRunning &&
                     !clientSocket.isClosed &&
                     !targetSocket.isClosed &&
                     clientSocket.isConnected &&
                     targetSocket.isConnected) {
-                    try {
-                        // Check for timeout (5 minutes of inactivity)
-                        if (System.currentTimeMillis() - lastActivityTime > 300000) {
-                            println("[$connectionId] $direction: Connection timeout due to inactivity")
-                            break
-                        }
-
-                        val bytesRead = from.read(buffer)
-                        if (bytesRead == -1) {
-                            println("[$connectionId] $direction: EOF received, closing connection gracefully")
-                            break
-                        }
-
-                        if (bytesRead > 0) {
-                            to.write(buffer, 0, bytesRead)
-                            to.flush()
-                            totalBytes += bytesRead
-                            lastActivityTime = System.currentTimeMillis()
-
-                            // 주기적으로 연결 상태 확인
-                            if (totalBytes % 10240 == 0L) {
-                                if (clientSocket.isClosed || targetSocket.isClosed) {
-                                    println("[$connectionId] $direction: Socket closed during transfer")
-                                    break
-                                }
-                            }
-                        }
-                    } catch (e: java.net.SocketTimeoutException) {
-                        // 타임아웃은 연결이 유지되고 있다면 정상 - 연결 상태 재확인
-                        if (clientSocket.isClosed || targetSocket.isClosed) {
-                            println("[$connectionId] $direction: Socket closed during timeout check")
-                            break
-                        }
-                        continue
-                    } catch (e: java.net.SocketException) {
-                        if (e.message?.contains("closed") == true ||
-                            e.message?.contains("reset") == true ||
-                            e.message?.contains("Broken pipe") == true) {
-                            println("[$connectionId] $direction: Connection terminated (${e.message})")
-                        } else {
-                            println("[$connectionId] $direction: Network error - ${e.message}")
-                        }
-                        break
-                    } catch (e: java.io.IOException) {
-                        println("[$connectionId] $direction: IO error - ${e.message}")
-                        break
-                    } catch (e: Exception) {
-                        println("[$connectionId] $direction: Unexpected error - ${e.message}")
+                    val now = System.currentTimeMillis()
+                    if (now - lastReadTime > idleTimeoutMillis) {
+                        println("[$connectionId] $direction idle timeout reached")
                         break
                     }
+                    val bytesRead = try {
+                        from.read(buffer)
+                    } catch (e: java.net.SocketTimeoutException) {
+                        continue
+                    }
+                    if (bytesRead == -1) {
+                        println("[$connectionId] $direction: EOF received, closing after timeout")
+                        break
+                    }
+                
+                    if (bytesRead > 0) {
+                        to.write(buffer, 0, bytesRead)
+                        to.flush()
+                        lastReadTime = now
+                    }
                 }
-
-                println("[$connectionId] $direction relay finished. Total bytes: $totalBytes")
-
+                println("[$connectionId] $direction relay finished")
             } catch (e: Exception) {
                 println("[$connectionId] $direction relay fatal error: ${e.message}")
             }
