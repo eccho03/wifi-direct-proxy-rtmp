@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
             val port = binding.etPort.text.toString().toIntOrNull() ?: 1081
             startService(SocksProxyService.newStartIntent(this, port))
             binding.etPort.setText(port.toString())
+            startTestRTMPStream()
         }
         binding.btnStop.setOnClickListener {
             stopService(SocksProxyService.newStopIntent(this))
