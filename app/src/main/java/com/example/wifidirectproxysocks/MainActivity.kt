@@ -27,6 +27,8 @@ class MainActivity : AppCompatActivity() {
 
     private var isServerRunning = false
     private val TAG = "WiFiDirect"
+    private lateinit var wifiDirectRTMPProxy: WiFiDirectRTMPProxy
+    private val youtubeRTMPUrl = "rtmp://a.rtmp.youtube.com/live2/eh8y-tw7s-g62s-zt2x-1hmt"
 
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -35,6 +37,7 @@ class MainActivity : AppCompatActivity() {
         if (granted) {
             Log.d(TAG, "✅ 권한 모두 허용됨")
             startWiFiDirectFlow()
+            initializeProxy()
         } else {
             Log.e(TAG, "❌ 권한 거부됨")
         }
@@ -50,17 +53,30 @@ class MainActivity : AppCompatActivity() {
         updateServerStatus(false, 0)
 
         binding.btnStart.setOnClickListener {
-            val port = binding.etPort.text.toString().toIntOrNull() ?: 1081
-            startService(SocksProxyService.newStartIntent(this, port))
-            binding.etPort.setText(port.toString())
-            startTestRTMPStream()
+            try {
+                val port = binding.etPort.text.toString().toIntOrNull() ?: 1081
+                binding.etPort.setText(port.toString())
+
+                if (!isServerRunning) {
+                    startProxy(port)
+                } else {
+                    Log.w(TAG, "Server is already running")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error starting server", e)
+            }
         }
+
         binding.btnStop.setOnClickListener {
-            stopService(SocksProxyService.newStopIntent(this))
-        }
-        useSystemProxy = binding.cbUseSystemProxy.isChecked
-        binding.cbUseSystemProxy.setOnCheckedChangeListener { _, isChecked ->
-            useSystemProxy = isChecked
+            try {
+                if (isServerRunning) {
+                    stopProxy()
+                } else {
+                    Log.w(TAG, "Server is not running")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping server", e)
+            }
         }
 
         manager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
@@ -68,8 +84,12 @@ class MainActivity : AppCompatActivity() {
 
         permissionsLauncher.launch(
             arrayOf(
+                Manifest.permission.ACCESS_WIFI_STATE,
+                Manifest.permission.CHANGE_WIFI_STATE,
                 Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.NEARBY_WIFI_DEVICES
+                Manifest.permission.INTERNET,
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO
             )
         )
 
@@ -89,7 +109,35 @@ class MainActivity : AppCompatActivity() {
             addAction("SERVER_STOPPED")
         }
         LocalBroadcastManager.getInstance(this).registerReceiver(wifiDirectReceiver, localFilter)
+    }
 
+    private fun startProxy(port: Int) {
+        try {
+            if (::wifiDirectRTMPProxy.isInitialized) {
+                wifiDirectRTMPProxy.startProxy(port = port, rtmpUrl = youtubeRTMPUrl)
+                updateServerStatus(true, port)
+                Log.d(TAG, "Proxy started on port $port")
+            } else {
+                Log.e(TAG, "WiFiDirectRTMPProxy not initialized")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start proxy", e)
+            updateServerStatus(false, 0)
+        }
+    }
+
+    private fun stopProxy() {
+        try {
+            if (::wifiDirectRTMPProxy.isInitialized) {
+                wifiDirectRTMPProxy.stopProxy()
+                updateServerStatus(false, 0)
+                Log.d(TAG, "Proxy stopped")
+            } else {
+                Log.e(TAG, "WiFiDirectRTMPProxy not initialized")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop proxy", e)
+        }
     }
 
     private fun updateServerStatus(isRunning: Boolean, port: Int) {
@@ -123,17 +171,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun resetWifiState(onComplete: () -> Unit) {
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        if (wifiManager.isWifiEnabled) {
-            wifiManager.isWifiEnabled = false
-            Handler(Looper.getMainLooper()).postDelayed({
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            if (wifiManager.isWifiEnabled) {
+                wifiManager.isWifiEnabled = false
+                Handler(Looper.getMainLooper()).postDelayed({
+                    wifiManager.isWifiEnabled = true
+                    Log.d(TAG, "📶 Wi-Fi 리셋 완료")
+                    onComplete()
+                }, 1500)
+            } else {
                 wifiManager.isWifiEnabled = true
-                Log.d(TAG, "📶 Wi-Fi 리셋 완료")
-                onComplete()
-            }, 1500)
-        } else {
-            wifiManager.isWifiEnabled = true
-            Handler(Looper.getMainLooper()).postDelayed(onComplete, 1000)
+                Handler(Looper.getMainLooper()).postDelayed(onComplete, 1000)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resetting WiFi state", e)
+            onComplete()
         }
     }
 
@@ -166,60 +219,102 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun removeCurrentGroup(onComplete: () -> Unit) {
-        manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "✅ 기존 그룹 제거됨")
-                onComplete()
-            }
+        try {
+            manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(TAG, "✅ 기존 그룹 제거됨")
+                    onComplete()
+                }
 
-            override fun onFailure(reason: Int) {
-                Log.w(TAG, "⚠️ 기존 그룹 제거 실패: $reason → 그래도 진행")
-                onComplete()
-            }
-        })
+                override fun onFailure(reason: Int) {
+                    Log.w(TAG, "⚠️ 기존 그룹 제거 실패: $reason → 그래도 진행")
+                    onComplete()
+                }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "Error removing current group", e)
+            onComplete()
+        }
     }
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
     private fun createWifiDirectGroup() {
-        manager.createGroup(channel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "✅ 그룹 생성됨")
-            }
+        try {
+            manager.createGroup(channel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(TAG, "✅ 그룹 생성됨")
+                }
 
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "❌ 그룹 생성 실패: $reason")
-            }
-        })
+                override fun onFailure(reason: Int) {
+                    Log.e(TAG, "❌ 그룹 생성 실패: $reason")
+                }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "Error creating WiFi Direct group", e)
+        }
     }
 
     private val wifiDirectReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION) {
-                val group = intent.getParcelableExtra<WifiP2pGroup>(WifiP2pManager.EXTRA_WIFI_P2P_GROUP)
-                if (group != null && group.isGroupOwner) {
-                    val ssid = group.networkName
-                    val pass = group.passphrase
-                    Log.d(TAG, "📡 그룹 정보 - SSID: $ssid, PASSWORD: $pass")
-                    // 화면에 띄우거나 QR 코드로 공유 가능
+            try {
+                if (intent?.action == WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION) {
+                    val group = intent.getParcelableExtra<WifiP2pGroup>(WifiP2pManager.EXTRA_WIFI_P2P_GROUP)
+                    if (group != null && group.isGroupOwner) {
+                        val ssid = group.networkName
+                        val pass = group.passphrase
+                        Log.d(TAG, "📡 그룹 정보 - SSID: $ssid, PASSWORD: $pass")
+                        // 화면에 띄우거나 QR 코드로 공유 가능
+                    }
                 }
-            }
-            when (intent?.action) {
-                "SERVER_STARTED" -> {
-                    val port = intent.getIntExtra("port", 1081)
-                    Log.d(TAG, "📥 SERVER_STARTED received, port=$port")
-                    updateServerStatus(true, port)
+                when (intent?.action) {
+                    "SERVER_STARTED" -> {
+                        val port = intent.getIntExtra("port", 1081)
+                        Log.d(TAG, "📥 SERVER_STARTED received, port=$port")
+                        updateServerStatus(true, port)
+                    }
+                    "SERVER_STOPPED" -> {
+                        updateServerStatus(false, 0)
+                    }
                 }
-                "SERVER_STOPPED" -> {
-                    updateServerStatus(false, 0)
-                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in wifiDirectReceiver", e)
             }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        stopService(SocksProxyService.newStopIntent(this))
-        unregisterReceiver(wifiDirectReceiver)
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(wifiDirectReceiver)
+
+        try {
+            // Stop proxy if running
+            if (isServerRunning && ::wifiDirectRTMPProxy.isInitialized) {
+                wifiDirectRTMPProxy.stopProxy()
+                Log.d(TAG, "WiFiDirectRTMPProxy stopped")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping proxy", e)
+        }
+
+        try {
+            unregisterReceiver(wifiDirectReceiver)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering receiver", e)
+        }
+
+        try {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(wifiDirectReceiver)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering local receiver", e)
+        }
+    }
+
+    private fun initializeProxy() {
+        try {
+            wifiDirectRTMPProxy = WiFiDirectRTMPProxy(this)
+            Log.d(TAG, "WiFiDirectRTMPProxy initialized")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize proxy", e)
+        }
     }
 }
