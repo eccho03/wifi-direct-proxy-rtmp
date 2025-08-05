@@ -19,7 +19,7 @@ class RTMPStreamManager {
         // 2. 잠시 대기 (YouTube 서버가 이전 연결을 정리할 시간)
         Thread.sleep(3000)
 
-        val inputFile = File(context.filesDir, "switzfsfsderland.mp4")
+        val inputFile = File(context.filesDir, "paris.mp4")
 
         if (!inputFile.exists()) {
             println("❌ 입력 파일이 없어서 테스트 스트림 생성 중...")
