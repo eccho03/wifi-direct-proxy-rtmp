@@ -8,6 +8,10 @@ import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
 import java.util.Properties
 import java.util.concurrent.atomic.AtomicReference
+import java.io.FileOutputStream
+import java.io.BufferedReader
+import java.io.InputStreamReader
+
 
 class RTMPStreamManager {
     private val currentSession = AtomicReference<FFmpegSession?>(null)
@@ -24,11 +28,14 @@ class RTMPStreamManager {
         Thread.sleep(3000)
 
         val inputFile = File(context.filesDir, "paris.mp4")
-
         if (!inputFile.exists()) {
-            println("❌ 입력 파일이 없어서 테스트 스트림 생성 중...")
-            createAndStreamTestVideo(context)
-            return
+            try {
+                copyRawToInternalStorage(context, R.raw.paris, "paris.mp4")
+            }
+            catch (e: Exception) {
+                println("❌ 파일 복사 실패: ${e.message}")
+                createAndStreamTestVideo(context)
+            }
         }
 
         println("🚀 새로운 RTMP 스트리밍 시작...")
@@ -121,6 +128,7 @@ class RTMPStreamManager {
         currentSession.get()?.let { session ->
             try {
                 session.cancel()
+                FFmpegKit.cancel()
                 println("🛑 세션 ${session.sessionId} 취소됨")
             } catch (e: Exception) {
                 println("⚠️ 세션 취소 중 오류: ${e.message}")
@@ -188,6 +196,36 @@ class RTMPStreamManager {
                 println("  ❓ 알 수 없는 오류")
                 println("  📋 최근 로그: ${logs.takeLast(500)}")
             }
+        }
+    }
+
+
+    fun copyRawToInternalStorage(context: Context, rawId: Int, fileName: String): File {
+        val outFile = File(context.filesDir, fileName)
+
+        // 이미 파일이 존재하면 삭제
+        if (outFile.exists()) {
+            outFile.delete()
+        }
+
+        try {
+            val inputStream = context.resources.openRawResource(rawId)
+            val outputStream = FileOutputStream(outFile)
+
+            inputStream.use { input ->
+                outputStream.use { output ->
+                    input.copyTo(output)
+                }
+            }
+
+            println("✅ Raw 파일 복사 완료: ${outFile.absolutePath}")
+            println("📁 파일 크기: ${outFile.length()} bytes")
+            println("📁 파일 존재: ${outFile.exists()}")
+
+            return outFile
+        } catch (e: Exception) {
+            println("❌ Raw 파일 복사 실패: ${e.message}")
+            throw e
         }
     }
 
