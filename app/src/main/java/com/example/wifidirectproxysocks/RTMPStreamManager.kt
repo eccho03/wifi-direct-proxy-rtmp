@@ -6,13 +6,17 @@ import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
+import java.util.Properties
 import java.util.concurrent.atomic.AtomicReference
 
 class RTMPStreamManager {
     private val currentSession = AtomicReference<FFmpegSession?>(null)
     private var isStreaming = false
 
-    fun startStream(context: Context, streamKey: String = "ep5u-25u6-fkvg-229k-9jz5") {
+    fun startStream(context: Context) {
+        // 0. 스트림키 받아오기
+        val STREAM_KEY = BuildConfig.STREAMING_KEY
+
         // 1. 기존 스트리밍 강제 종료
         stopStreamForcefully()
 
@@ -23,7 +27,7 @@ class RTMPStreamManager {
 
         if (!inputFile.exists()) {
             println("❌ 입력 파일이 없어서 테스트 스트림 생성 중...")
-            createAndStreamTestVideo(context, streamKey)
+            createAndStreamTestVideo(context)
             return
         }
 
@@ -38,7 +42,7 @@ class RTMPStreamManager {
             "-preset", "ultrafast",
             "-pix_fmt", "yuv420p",
             "-f", "flv",
-            "rtmp://a.rtmp.youtube.com/live2/eh8y-tw7s-g62s-zt2x-1hmt"
+            "rtmp://a.rtmp.youtube.com/live2/${STREAM_KEY}"
         ).joinToString(" ")
 
         println("🎬 RTMP 명령어: $command")
@@ -187,8 +191,9 @@ class RTMPStreamManager {
         }
     }
 
-    private fun createAndStreamTestVideo(context: Context, streamKey: String) {
+    private fun createAndStreamTestVideo(context: Context) {
         println("🎬 테스트 비디오 생성 후 스트리밍...")
+        val STREAM_KEY = BuildConfig.STREAMING_KEY
 
         // 간단한 테스트 패턴으로 직접 스트리밍
         val command = listOf(
@@ -210,7 +215,7 @@ class RTMPStreamManager {
             "-ac", "2",
             "-f", "flv",
             "-rtmp_live", "live",
-            "rtmp://a.rtmp.youtube.com/live2/$streamKey"
+            "rtmp://a.rtmp.youtube.com/live2/$STREAM_KEY"
         ).joinToString(" ")
 
         println("🎬 테스트 스트림 명령어: $command")

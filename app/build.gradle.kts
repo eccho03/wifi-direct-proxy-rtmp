@@ -1,7 +1,10 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
+
 
 android {
     namespace = "com.example.wifidirectproxysocks"
@@ -15,6 +18,17 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        val localProperties = Properties().apply {
+            load(rootProject.file("local.properties").inputStream())
+        }
+
+        val streamKey = localProperties.getProperty("STREAMING_KEY") ?: throw GradleException("Streaming Key가 local.properties에 없습니다")
+        buildConfigField("String", "STREAMING_KEY", streamKey)
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
