@@ -9,85 +9,102 @@ import java.io.FileOutputStream
 import java.io.InputStreamReader
 
 fun startTestRTMPStream(context: Context) {
-//    val command = listOf(
-//        "-f", "lavfi",
-//        "-i", "testsrc=size=1280x720:rate=30",
-//        "-vcodec", "libx264",
-//        "-preset", "ultrafast",
-//        "-tune", "zerolatency",
-//        "-pix_fmt", "yuv420p",
-//        "-f", "flv",
-//        "rtmp://a.rtmp.youtube.com/live2/eh8y-tw7s-g62s-zt2x-1hmt"
-//    ).joinToString(" ")
+    val inputFile = File(context.filesDir, "output_rotated_metadata.mp4")
 
-    val inputFile = File(context.filesDir, "output_rotated_metadata.mp4").absolutePath
+    // 파일 존재 여부 확인
+    if (!inputFile.exists()) {
+        println("❌ 입력 파일이 존재하지 않습니다: ${inputFile.absolutePath}")
+
+        // Raw 리소스에서 파일 복사 시도 (예시)
+        try {
+            // R.raw.output_rotated_metadata가 있다면
+            copyRawToInternalStorage(context, R.raw.output_rotated_metadata, "output_rotated_metadata.mp4")
+
+            // 또는 assets 폴더에서 복사
+            // copyAssetToInternalStorage(context, "output_rotated_metadata.mp4", "output_rotated_metadata.mp4")
+        } catch (e: Exception) {
+            println("❌ 파일 복사 실패: ${e.message}")
+            return
+        }
+    }
+
+    // 파일 정보 출력
+    println("📁 파일 경로: ${inputFile.absolutePath}")
+    println("📁 파일 존재: ${inputFile.exists()}")
+    println("📁 파일 크기: ${inputFile.length()} bytes")
+    println("📁 읽기 가능: ${inputFile.canRead()}")
 
     val command = listOf(
         "-re", // 실시간처럼 입력을 읽음
-        "-i", inputFile, // 입력 파일
+        "-i", inputFile.absolutePath, // 절대 경로 사용
         "-c", "copy", // 인코딩 없이 그대로 전송
         "-f", "flv", // 출력 포맷
         "rtmp://a.rtmp.youtube.com/live2/eh8y-tw7s-g62s-zt2x-1hmt"
     ).joinToString(" ")
 
+    println("🎬 FFmpeg 명령어: $command")
+
     FFmpegKit.executeAsync(command) { session ->
         val returnCode = session.returnCode
+        val logs = session.logsAsString
+
         if (ReturnCode.isSuccess(returnCode)) {
             println("✅ RTMP 스트리밍 성공")
         } else {
-            println("❌ FFmpeg 오류: ${session.failStackTrace}")
+            println("❌ FFmpeg 오류 코드: $returnCode")
+            println("❌ FFmpeg 로그: $logs")
+            println("❌ FFmpeg 스택트레이스: ${session.failStackTrace}")
         }
     }
-
 }
 
 fun copyRawToInternalStorage(context: Context, rawId: Int, fileName: String): File {
-    val inputStream = context.resources.openRawResource(rawId)
     val outFile = File(context.filesDir, fileName)
-    val outputStream = FileOutputStream(outFile)
 
-    inputStream.copyTo(outputStream)
-    inputStream.close()
-    outputStream.close()
+    // 이미 파일이 존재하면 삭제
+    if (outFile.exists()) {
+        outFile.delete()
+    }
 
-    println("✅ 복사 완료: ${outFile.absolutePath}, 존재 여부: ${outFile.exists()}")
-    return outFile
+    try {
+        val inputStream = context.resources.openRawResource(rawId)
+        val outputStream = FileOutputStream(outFile)
+
+        inputStream.use { input ->
+            outputStream.use { output ->
+                input.copyTo(output)
+            }
+        }
+
+        println("✅ Raw 파일 복사 완료: ${outFile.absolutePath}")
+        println("📁 파일 크기: ${outFile.length()} bytes")
+        println("📁 파일 존재: ${outFile.exists()}")
+
+        return outFile
+    } catch (e: Exception) {
+        println("❌ Raw 파일 복사 실패: ${e.message}")
+        throw e
+    }
 }
 
+// 테스트용 간단한 비디오 파일 생성
+fun createTestVideoFile(context: Context): File {
+    val testFile = File(context.filesDir, "test_video.mp4")
 
-//fun startTestRTMPStream() {
-//    val inputPath = "/Users/Eunchae/input.mp4"
-//    val outputPath = "rtmp://a.rtmp.youtube.com/live2/eh8y-tw7s-g62s-zt2x-1hmt"
-//
-//    // FFmpeg 실행 명령어 리스트
-//    val commandList = listOf(
-//        "ffmpeg", // FFmpeg 실행 파일 이름
-//        "-re",
-//        "-i", inputPath,
-//        "-c", "copy",
-//        "-f", "flv",
-//        outputPath
-//    )
-//
-//    // ProcessBuilder를 사용하여 명령어 실행
-//    val processBuilder = ProcessBuilder(commandList)
-//    processBuilder.redirectErrorStream(true) // 에러와 출력을 함께 읽기 위해 설정
-//
-//    try {
-//        val process = processBuilder.start()
-//
-//        // 프로세스의 출력 스트림 읽기 (FFmpeg 로그 확인용)
-//        val reader = BufferedReader(InputStreamReader(process.inputStream))
-//        var line: String?
-//        while (reader.readLine().also { line = it } != null) {
-//            println(line)
-//        }
-//
-//        // 프로세스 종료를 기다림
-//        val exitCode = process.waitFor()
-//        println("FFmpeg process finished with exit code $exitCode")
-//
-//    } catch (e: Exception) {
-//        e.printStackTrace()
-//    }
-//}
+    // FFmpeg로 간단한 테스트 비디오 생성
+    val command = listOf(
+        "-f", "lavfi",
+        "-i", "testsrc=size=640x480:rate=1:duration=10", // 10초짜리 테스트 비디오
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        "-y", // 덮어쓰기
+        testFile.absolutePath
+    ).joinToString(" ")
+
+    println("🎬 테스트 비디오 생성: $command")
+
+    FFmpegKit.execute(command)
+
+    return testFile
+}
