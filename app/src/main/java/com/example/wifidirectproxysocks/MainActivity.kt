@@ -21,7 +21,8 @@ import com.example.wifidirectproxysocks.databinding.ActivityMainBinding
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var manager: WifiP2pManager
+    private lateinit var wifiManager: WifiP2pManager
+    private lateinit var streamManager: RTMPStreamManager
     private lateinit var channel: WifiP2pManager.Channel
     private lateinit var binding: ActivityMainBinding
 
@@ -59,8 +60,7 @@ class MainActivity : AppCompatActivity() {
 
                 if (!isServerRunning) {
                     startProxy(port)
-                    copyRawToInternalStorage(this, R.raw.output_rotated_metadata, "input.mp4")
-                    startTestRTMPStream(this)
+                    startStreaming()
                 } else {
                     Log.w(TAG, "Server is already running")
                 }
@@ -73,6 +73,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 if (isServerRunning) {
                     stopProxy()
+                    stopStreaming()
                 } else {
                     Log.w(TAG, "Server is not running")
                 }
@@ -81,8 +82,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        manager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
-        channel = manager.initialize(this, mainLooper, null)
+        wifiManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
+        channel = wifiManager.initialize(this, mainLooper, null)
 
         permissionsLauncher.launch(
             arrayOf(
@@ -194,7 +195,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun clearPersistentGroups(onComplete: () -> Unit) {
         try {
-            val method = manager.javaClass.getMethod(
+            val method = wifiManager.javaClass.getMethod(
                 "deletePersistentGroup",
                 WifiP2pManager.Channel::class.java,
                 Int::class.javaPrimitiveType,
@@ -202,7 +203,7 @@ class MainActivity : AppCompatActivity() {
             )
             var pending = 32
             for (i in 0 until 32) {
-                method.invoke(manager, channel, i, object : WifiP2pManager.ActionListener {
+                method.invoke(wifiManager, channel, i, object : WifiP2pManager.ActionListener {
                     override fun onSuccess() {
                         Log.d(TAG, "🧹 Persistent group $i deleted")
                         if (--pending == 0) onComplete()
@@ -222,7 +223,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun removeCurrentGroup(onComplete: () -> Unit) {
         try {
-            manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+            wifiManager.removeGroup(channel, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     Log.d(TAG, "✅ 기존 그룹 제거됨")
                     onComplete()
@@ -242,7 +243,7 @@ class MainActivity : AppCompatActivity() {
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.NEARBY_WIFI_DEVICES])
     private fun createWifiDirectGroup() {
         try {
-            manager.createGroup(channel, object : WifiP2pManager.ActionListener {
+            wifiManager.createGroup(channel, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
                     Log.d(TAG, "✅ 그룹 생성됨")
                 }
@@ -313,10 +314,30 @@ class MainActivity : AppCompatActivity() {
     private fun initializeProxy() {
         try {
             wifiDirectRTMPProxy = WiFiDirectRTMPProxy(this)
+            streamManager = RTMPStreamManager()
             Log.d(TAG, "WiFiDirectRTMPProxy initialized")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize proxy", e)
         }
+    }
+
+    fun startStreaming() {
+        if (streamManager.isCurrentlyStreaming()) {
+            println("⚠️ 이미 스트리밍 중입니다")
+            return
+        }
+
+        println("🚀 스트리밍 시작...")
+        streamManager.startStream(this)
+    }
+
+    fun stopStreaming() {
+        println("🛑 스트리밍 중지...")
+        streamManager.stopStreamForcefully()
+    }
+
+    fun checkStatus() {
+        println("📊 현재 상태: ${streamManager.getStreamingStatus()}")
     }
 }
