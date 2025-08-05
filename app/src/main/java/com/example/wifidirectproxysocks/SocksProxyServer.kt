@@ -29,29 +29,28 @@ class SocksProxyServer(private val port: Int) {
             try {
                 serverSocket = ServerSocket(port)
                 serverSocket?.reuseAddress = true
-                serverSocket?.soTimeout = 0 // Non-blocking accept
-                serverSocket?.receiveBufferSize = 8192
-                //serverSocket?.sendBufferSize = 8192
+                serverSocket?.soTimeout = 1000 // 1초 타임아웃으로 주기적 체크
+                serverSocket?.receiveBufferSize = 16384 // 버퍼 크기 증가
                 isRunning = true
                 println("SOCKS proxy server started on port $port")
 
-                while (isRunning) {
+                while (isRunning && serverScope.isActive) {
                     try {
                         // Check connection limit
                         if (activeConnections.size >= maxConnections) {
                             println("Maximum connections reached (${maxConnections}), waiting...")
-                            kotlinx.coroutines.delay(1000)
+                            kotlinx.coroutines.delay(100) // 대기 시간 단축
                             continue
                         }
 
                         val clientSocket = serverSocket?.accept()
                         clientSocket?.let { socket ->
-                            // Set socket options for better stability
-                            socket.keepAlive = true
+                            // Set socket options for better performance
+                            socket.keepAlive = false // keep-alive 비활성화로 성능 향상
                             socket.tcpNoDelay = true
-                            socket.soTimeout = 30000 // 30 second read timeout
-                            socket.receiveBufferSize = 8192
-                            socket.sendBufferSize = 8192
+                            socket.soTimeout = 10000 // 타임아웃 단축 (10초)
+                            socket.receiveBufferSize = 16384 // 버퍼 크기 증가
+                            socket.sendBufferSize = 16384
 
                             clientSockets.add(socket)
                             launch {
@@ -63,14 +62,17 @@ class SocksProxyServer(private val port: Int) {
                                 }
                             }
                         }
+                    } catch (e: java.net.SocketTimeoutException) {
+                        // 정상적인 타임아웃, 계속 진행
+                        continue
                     } catch (e: Exception) {
                         if (isRunning) {
                             println("Error accepting client: ${e.message}")
-                            // Brief pause to prevent tight loop
-                            kotlinx.coroutines.delay(100)
+                            kotlinx.coroutines.delay(50) // 대기 시간 단축
                         }
                     }
                 }
+                println("SOCKS proxy server stopped")
             } catch (e: Exception) {
                 println("SOCKS proxy server error: ${e.message}")
             }
@@ -85,102 +87,96 @@ class SocksProxyServer(private val port: Int) {
                 val input = clientSocket.getInputStream()
                 val output = clientSocket.getOutputStream()
 
-                val handshakeStart = System.currentTimeMillis()
-
-                // 1. SOCKS5 handshake
-                val handshakeHeader = ByteArray(2)
-                if (input.read(handshakeHeader) != 2 || handshakeHeader[0] != 0x05.toByte()) {
-                    println("[$connectionId] Not a SOCKS5 client or handshake too short")
-                    cleanup(clientSocket)
-                    return@withContext
-                }
-                val nMethods = handshakeHeader[1].toInt() and 0xFF
-                val methods = ByteArray(nMethods)
-                if (input.read(methods) != nMethods) {
-                    println("[$connectionId] Could not read all methods")
-                    cleanup(clientSocket)
-                    return@withContext
-                }
-                // Reply: no authentication
-                output.write(byteArrayOf(0x05, 0x00))
-                output.flush()
-                val handshakeEnd = System.currentTimeMillis()
-                println("[$connectionId] Handshake took ${handshakeEnd - handshakeStart} ms")
-
-                val connectStart = System.currentTimeMillis()
-
-                // 2. SOCKS5 request
-                val reqHeader = ByteArray(4)
-                if (input.read(reqHeader) != 4) {
-                    println("[$connectionId] Could not read request header")
-                    cleanup(clientSocket)
-                    return@withContext
-                }
-                val cmd = reqHeader[1]
-                val atyp = reqHeader[3]
-                var address = ""
-                var port = 0
-                when (atyp.toInt()) {
-                    0x01 -> { // IPv4
-                        val addr = ByteArray(4)
-                        if (input.read(addr) != 4) {
-                            println("[$connectionId] Could not read IPv4 address")
-                            cleanup(clientSocket)
-                            return@withContext
-                        }
-                        address = addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
-                    }
-                    0x03 -> { // Domain
-                        val len = input.read()
-                        if (len <= 0) {
-                            println("[$connectionId] Invalid domain length")
-                            cleanup(clientSocket)
-                            return@withContext
-                        }
-                        val addr = ByteArray(len)
-                        if (input.read(addr) != len) {
-                            println("[$connectionId] Could not read domain name")
-                            cleanup(clientSocket)
-                            return@withContext
-                        }
-                        address = String(addr)
-                    }
-                    0x04 -> { // IPv6
-                        val addr = ByteArray(16)
-                        if (input.read(addr) != 16) {
-                            println("[$connectionId] Could not read IPv6 address")
-                            cleanup(clientSocket)
-                            return@withContext
-                        }
-                        address = java.net.InetAddress.getByAddress(addr).hostAddress
-                    }
-                    else -> {
-                        println("[$connectionId] Unsupported address type: $atyp")
+                // 1. SOCKS5 handshake - 타임아웃 추가
+                withTimeout(5000) { // 5초 타임아웃
+                    val handshakeHeader = ByteArray(2)
+                    if (input.read(handshakeHeader) != 2 || handshakeHeader[0] != 0x05.toByte()) {
+                        println("[$connectionId] Not a SOCKS5 client or handshake too short")
                         cleanup(clientSocket)
-                        return@withContext
+                        return@withTimeout
+                    }
+                    val nMethods = handshakeHeader[1].toInt() and 0xFF
+                    val methods = ByteArray(nMethods)
+                    if (input.read(methods) != nMethods) {
+                        println("[$connectionId] Could not read all methods")
+                        cleanup(clientSocket)
+                        return@withTimeout
+                    }
+                    // Reply: no authentication
+                    output.write(byteArrayOf(0x05, 0x00))
+                    output.flush()
+                }
+
+                // 2. SOCKS5 request - 타임아웃 추가
+                withTimeout(5000) { // 5초 타임아웃
+                    val reqHeader = ByteArray(4)
+                    if (input.read(reqHeader) != 4) {
+                        println("[$connectionId] Could not read request header")
+                        cleanup(clientSocket)
+                        return@withTimeout
+                    }
+                    val cmd = reqHeader[1]
+                    val atyp = reqHeader[3]
+                    var address = ""
+                    var port = 0
+                    when (atyp.toInt()) {
+                        0x01 -> { // IPv4
+                            val addr = ByteArray(4)
+                            if (input.read(addr) != 4) {
+                                println("[$connectionId] Could not read IPv4 address")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            address = addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
+                        }
+                        0x03 -> { // Domain
+                            val len = input.read()
+                            if (len <= 0) {
+                                println("[$connectionId] Invalid domain length")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            val addr = ByteArray(len)
+                            if (input.read(addr) != len) {
+                                println("[$connectionId] Could not read domain name")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            address = String(addr)
+                        }
+                        0x04 -> { // IPv6
+                            val addr = ByteArray(16)
+                            if (input.read(addr) != 16) {
+                                println("[$connectionId] Could not read IPv6 address")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            address = java.net.InetAddress.getByAddress(addr).hostAddress
+                        }
+                        else -> {
+                            println("[$connectionId] Unsupported address type: $atyp")
+                            cleanup(clientSocket)
+                            return@withTimeout
+                        }
+                    }
+                    val portBytes = ByteArray(2)
+                    if (input.read(portBytes) != 2) {
+                        println("[$connectionId] Could not read port")
+                        cleanup(clientSocket)
+                        return@withTimeout
+                    }
+                    port = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
+
+                    if (cmd == 0x01.toByte()) { // CONNECT
+                        handleConnectStrict(address, port, output, clientSocket, connectionId)
+                    } else {
+                        println("[$connectionId] Unsupported command: $cmd")
+                        val response = byteArrayOf(0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+                        output.write(response)
+                        output.flush()
+                        cleanup(clientSocket)
                     }
                 }
-                val portBytes = ByteArray(2)
-                if (input.read(portBytes) != 2) {
-                    println("[$connectionId] Could not read port")
-                    cleanup(clientSocket)
-                    return@withContext
-                }
-                port = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
-
-                if (cmd == 0x01.toByte()) { // CONNECT
-                    handleConnectStrict(address, port, output, clientSocket, connectionId)
-                } else {
-                    println("[$connectionId] Unsupported command: $cmd")
-                    val response = byteArrayOf(0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
-                    output.write(response)
-                    output.flush()
-                    cleanup(clientSocket)
-                }
-
-                val connectEnd = System.currentTimeMillis()
-                println("[$connectionId] Connect to $port took ${connectEnd - connectStart} ms")
-
 
             } catch (e: Exception) {
                 println("[$connectionId] Client handling error: ${e.message}")
@@ -194,12 +190,13 @@ class SocksProxyServer(private val port: Int) {
         try {
             println("[$connectionId] Connecting to $host:$port")
             targetSocket = Socket()
-            targetSocket.keepAlive = true
+            targetSocket.keepAlive = false // keep-alive 비활성화
             targetSocket.tcpNoDelay = true
-            targetSocket.soTimeout = 30000
-            targetSocket.receiveBufferSize = 8192
-            targetSocket.sendBufferSize = 8192
-            targetSocket.connect(java.net.InetSocketAddress(host, port), 10000)
+            targetSocket.soTimeout = 10000 // 타임아웃 단축
+            targetSocket.receiveBufferSize = 16384 // 버퍼 크기 증가
+            targetSocket.sendBufferSize = 16384
+            targetSocket.connect(java.net.InetSocketAddress(host, port), 5000) // 연결 타임아웃 단축
+
             if (targetSocket.isConnected) {
                 println("[$connectionId] Successfully connected to $host:$port")
                 val response = byteArrayOf(0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
@@ -264,8 +261,6 @@ class SocksProxyServer(private val port: Int) {
     private fun startRelay(clientSocket: Socket, targetSocket: Socket, connectionId: String, connectionKey: String) {
         // 개별 스코프로 릴레이 작업 격리
         val relayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val relayStart = System.currentTimeMillis()
-
 
         val clientToServerJob = relayScope.launch {
             try {
@@ -311,51 +306,70 @@ class SocksProxyServer(private val port: Int) {
                 cleanupConnection(clientSocket, targetSocket, connectionId, connectionKey)
             }
         }
-        val relayEnd = System.currentTimeMillis()
-        println("[$connectionId] Relay finished in ${relayEnd - relayStart} ms")
     }
 
     private suspend fun relayData(
-    from: InputStream,
-    to: OutputStream,
-    direction: String,
-    connectionId: String,
-    clientSocket: Socket,
-    targetSocket: Socket
+        from: java.io.InputStream,
+        to: java.io.OutputStream,
+        direction: String,
+        connectionId: String,
+        clientSocket: Socket,
+        targetSocket: Socket
     ) {
         withContext(Dispatchers.IO) {
             try {
-                val idleTimeoutMillis = 5000L
-                var lastReadTime = System.currentTimeMillis()
+                val buffer = ByteArray(16384) // 버퍼 크기 증가
+                var totalBytes = 0L
 
-                val buffer = ByteArray(8192)
-                while (isRunning &&
+                while (isRunning && serverScope.isActive &&
                     !clientSocket.isClosed &&
                     !targetSocket.isClosed &&
                     clientSocket.isConnected &&
                     targetSocket.isConnected) {
-                    val now = System.currentTimeMillis()
-                    if (now - lastReadTime > idleTimeoutMillis) {
-                        println("[$connectionId] $direction idle timeout reached")
-                        break
-                    }
-                    val bytesRead = try {
-                        from.read(buffer)
+                    try {
+                        val bytesRead = from.read(buffer)
+                        if (bytesRead == -1) {
+                            println("[$connectionId] $direction: EOF received, closing connection")
+                            break // EOF 받으면 즉시 연결 종료
+                        }
+
+                        if (bytesRead > 0) {
+                            to.write(buffer, 0, bytesRead)
+                            to.flush()
+                            totalBytes += bytesRead
+
+                            // 연결 상태 확인 빈도 줄임
+                            if (totalBytes % 32768 == 0L) {
+                                if (clientSocket.isClosed || targetSocket.isClosed) {
+                                    println("[$connectionId] $direction: Socket closed during transfer")
+                                    break
+                                }
+                            }
+                        }
                     } catch (e: java.net.SocketTimeoutException) {
-                        continue
-                    }
-                    if (bytesRead == -1) {
-                        println("[$connectionId] $direction: EOF received, closing after timeout")
+                        // 타임아웃 시 연결 종료
+                        println("[$connectionId] $direction: Read timeout, closing connection")
                         break
-                    }
-                
-                    if (bytesRead > 0) {
-                        to.write(buffer, 0, bytesRead)
-                        to.flush()
-                        lastReadTime = now
+                    } catch (e: java.net.SocketException) {
+                        if (e.message?.contains("closed") == true ||
+                            e.message?.contains("reset") == true ||
+                            e.message?.contains("Broken pipe") == true) {
+                            println("[$connectionId] $direction: Connection terminated (${e.message})")
+                        } else {
+                            println("[$connectionId] $direction: Network error - ${e.message}")
+                        }
+                        break
+                    } catch (e: java.io.IOException) {
+                        println("[$connectionId] $direction: IO error - ${e.message}")
+                        break
+                    } catch (e: Exception) {
+                        println("[$connectionId] $direction: Unexpected error - ${e.message}")
+                        break
                     }
                 }
-                println("[$connectionId] $direction relay finished")
+
+                println("[$connectionId] $direction relay finished. Total bytes: $totalBytes")
+
             } catch (e: Exception) {
                 println("[$connectionId] $direction relay fatal error: ${e.message}")
             }
@@ -367,43 +381,33 @@ class SocksProxyServer(private val port: Int) {
 
         activeConnections.remove(connectionKey)
 
-        // 소켓들을 우아하게 종료
+        // 소켓들을 빠르게 종료
         try {
-            if (!clientSocket.isClosed && clientSocket.isConnected) {
+            if (!clientSocket.isClosed) {
                 try {
                     clientSocket.shutdownOutput()
-                } catch (e: Exception) {
-                    // 이미 닫힌 경우 무시
-                }
-                try {
                     clientSocket.shutdownInput()
                 } catch (e: Exception) {
-                    // 이미 닫힌 경우 무시
+                    // 무시
                 }
                 clientSocket.close()
-                println("[$connectionId] Client socket closed")
             }
         } catch (e: Exception) {
-            println("[$connectionId] Error closing client socket: ${e.message}")
+            // 무시
         }
 
         try {
-            if (!targetSocket.isClosed && targetSocket.isConnected) {
+            if (!targetSocket.isClosed) {
                 try {
                     targetSocket.shutdownOutput()
-                } catch (e: Exception) {
-                    // 이미 닫힌 경우 무시
-                }
-                try {
                     targetSocket.shutdownInput()
                 } catch (e: Exception) {
-                    // 이미 닫힌 경우 무시
+                    // 무시
                 }
                 targetSocket.close()
-                println("[$connectionId] Target socket closed")
             }
         } catch (e: Exception) {
-            println("[$connectionId] Error closing target socket: ${e.message}")
+            // 무시
         }
 
         clientSockets.remove(clientSocket)
@@ -417,7 +421,7 @@ class SocksProxyServer(private val port: Int) {
                 clientSocket.close()
             }
         } catch (e: Exception) {
-            println("Error closing client socket during cleanup: ${e.message}")
+            // 무시
         }
     }
 
@@ -431,7 +435,7 @@ class SocksProxyServer(private val port: Int) {
                 client.close()
                 target.close()
             } catch (e: Exception) {
-                println("Error closing active connection: ${e.message}")
+                // 무시
             }
         }
         activeConnections.clear()
@@ -441,7 +445,7 @@ class SocksProxyServer(private val port: Int) {
             try {
                 socket.close()
             } catch (e: Exception) {
-                println("Error closing client socket: ${e.message}")
+                // 무시
             }
         }
         clientSockets.clear()
@@ -450,7 +454,7 @@ class SocksProxyServer(private val port: Int) {
         try {
             serverSocket?.close()
         } catch (e: Exception) {
-            println("Error closing server socket: ${e.message}")
+            // 무시
         }
 
         // 스코프 취소
@@ -464,5 +468,17 @@ class SocksProxyServer(private val port: Int) {
 
     fun getClientSocketCount(): Int {
         return clientSockets.size
+    }
+
+    fun isServerRunning(): Boolean {
+        return isRunning
+    }
+
+    fun getServerStatus(): String {
+        return if (isRunning) {
+            "Running on port $port (${activeConnections.size} active connections)"
+        } else {
+            "Stopped"
+        }
     }
 }

@@ -59,7 +59,8 @@ class MainActivity : AppCompatActivity() {
 
                 if (!isServerRunning) {
                     startProxy(port)
-                    startTestRTMPStream()
+                    copyRawToInternalStorage(this, R.raw.output_rotated_metadata, "input.mp4")
+                    startTestRTMPStream(this)
                 } else {
                     Log.w(TAG, "Server is already running")
                 }
