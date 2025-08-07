@@ -29,7 +29,8 @@ class MainActivity : AppCompatActivity() {
     private var isServerRunning = false
     private val TAG = "WiFiDirect"
     private lateinit var wifiDirectRTMPProxy: WiFiDirectRTMPProxy
-    private val youtubeRTMPUrl = "rtmp://a.rtmp.youtube.com/live2/eh8y-tw7s-g62s-zt2x-1hmt"
+    private val STREAM_KEY = BuildConfig.STREAMING_KEY
+    private val youtubeRTMPUrl = "rtmp://a.rtmp.youtube.com/live2/$STREAM_KEY"
 
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()

@@ -27,15 +27,42 @@ class RTMPStreamManager {
         // 2. 잠시 대기 (YouTube 서버가 이전 연결을 정리할 시간)
         Thread.sleep(3000)
 
-        val inputFile = File(context.filesDir, "paris.mp4")
+        val inputFile = File(context.filesDir, "game.mp4")
         if (!inputFile.exists()) {
             try {
-                copyRawToInternalStorage(context, R.raw.paris, "paris.mp4")
+                copyRawToInternalStorage(context, R.raw.game, "game.mp4")
             }
             catch (e: Exception) {
                 println("❌ 파일 복사 실패: ${e.message}")
                 createAndStreamTestVideo(context)
             }
+        }
+        val probeCommand = listOf(
+            "-i", inputFile.absolutePath,
+            "-hide_banner"
+        ).joinToString(" ")
+
+        val probeSession = FFmpegKit.execute(probeCommand)
+        val output = probeSession.allLogsAsString
+
+// 오디오 트랙 있는지 확인
+        val hasAudio = output.contains("Stream #") && output.contains("Audio")
+        val durationRegex = Regex("Duration: (\\d+):(\\d+):(\\d+\\.\\d+)")
+        val durationMatch = durationRegex.find(output)
+
+        val durationSeconds: Double = if (durationMatch != null) {
+            val (h, m, s) = durationMatch.destructured
+            h.toInt() * 3600 + m.toInt() * 60 + s.toDouble()
+        } else {
+            0.0
+        }
+
+        println("🧪 FFmpeg 분석 결과: 오디오=$hasAudio, 길이=${"%.1f".format(durationSeconds)}초")
+
+        if (!hasAudio || durationSeconds < 5.0) {
+            println("⚠️ 입력 영상이 무음이거나 너무 짧음 → 테스트 스트림으로 대체")
+            createAndStreamTestVideo(context)
+            return
         }
 
         println("🚀 새로운 RTMP 스트리밍 시작...")
