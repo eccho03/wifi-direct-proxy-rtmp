@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.ColorStateList
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pManager
@@ -13,11 +14,18 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresPermission
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.example.wifidirectproxysocks.databinding.ActivityMainBinding
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -26,11 +34,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var channel: WifiP2pManager.Channel
     private lateinit var binding: ActivityMainBinding
 
-    private var isServerRunning = false
+    private var isProxyRunning = false
+    private var isStreamRunning = false
     private val TAG = "WiFiDirect"
     private lateinit var wifiDirectRTMPProxy: WiFiDirectRTMPProxy
     private val STREAM_KEY = BuildConfig.STREAMING_KEY
     private val youtubeRTMPUrl = "rtmp://a.rtmp.youtube.com/live2/$STREAM_KEY"
+
+    // Video selection data
+    private val videoList = listOf<Pair<String, Int>>(
+        "Select video..." to 0,
+        "paris" to R.raw.paris,
+        "game" to R.raw.game,
+        "festival" to R.raw.festival,
+        "millan" to R.raw.millan,
+        "mt" to R.raw.mt,
+        "workout" to R.raw.workout
+    )
+
+    private var selectedVideoIndex = 0
 
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -42,6 +64,7 @@ class MainActivity : AppCompatActivity() {
             initializeProxy()
         } else {
             Log.e(TAG, "❌ 권한 거부됨")
+            Toast.makeText(this, "필요한 권한이 거부되었습니다.", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -51,55 +74,145 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // 서버 상태 초기화
-        updateServerStatus(false, 0)
+        // 초기 상태 설정
+        updateProxyStatus(false, 0)
+        updateStreamStatus(false)
+        setupVideoSpinner()
+        setupClickListeners()
 
+        // WiFi Direct 초기화
+        wifiManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
+        channel = wifiManager.initialize(this, mainLooper, null)
+
+        // 권한 요청
+        requestPermissions()
+
+        // 브로드캐스트 리시버 등록
+        registerReceivers()
+    }
+
+    private fun setupVideoSpinner() {
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, videoList)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        binding.spinnerVideo.adapter = adapter
+
+        binding.spinnerVideo.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                selectedVideoIndex = position
+                updateVideoInfo(position)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {
+                selectedVideoIndex = 0
+                updateVideoInfo(0)
+            }
+        }
+    }
+
+    private fun updateVideoInfo(position: Int) {
+        val infoText = when (position) {
+            0 -> "비디오를 선택해주세요"
+            1 -> "해상도: 1280x720, 길이: 10분"
+            2 -> "해상도: 1920x1080, 길이: 15분"
+            3 -> "해상도: 3840x2160, 길이: 5분"
+            4 -> "테스트 패턴, 해상도: 1920x1080"
+            else -> "알 수 없는 비디오"
+        }
+        binding.tvVideoInfo.text = infoText
+    }
+
+    private fun setupClickListeners() {
         binding.btnStart.setOnClickListener {
             try {
-                val port = binding.etPort.text.toString().toIntOrNull() ?: 1081
-                binding.etPort.setText(port.toString())
+                if (selectedVideoIndex == 0) {
+                    Toast.makeText(this, "먼저 비디오를 선택해주세요", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
 
-                if (!isServerRunning) {
+                val portText = binding.etPort.text.toString()
+                if (portText.isEmpty()) {
+                    binding.etPort.setText("1081")
+                }
+
+                val port = binding.etPort.text.toString().toIntOrNull() ?: 1081
+
+                if (port < 1024) {
+                    Toast.makeText(this, "포트는 1024 이상이어야 합니다", Toast.LENGTH_SHORT).show()
+                    binding.etPort.setText("1081")
+                    return@setOnClickListener
+                }
+
+                if (!isProxyRunning) {
                     startProxy(port)
+                } else {
+                    Log.w(TAG, "Proxy is already running")
+                    Toast.makeText(this, "프록시가 이미 실행 중입니다", Toast.LENGTH_SHORT).show()
+                }
+
+                if (!isStreamRunning) {
                     startStreaming()
                 } else {
-                    Log.w(TAG, "Server is already running")
+                    Log.w(TAG, "Stream is already running")
+                    Toast.makeText(this, "스트리밍이 이미 실행 중입니다", Toast.LENGTH_SHORT).show()
                 }
+
             } catch (e: Exception) {
-                Log.e(TAG, "Error starting server", e)
+                Log.e(TAG, "Error starting services", e)
+                Toast.makeText(this, "서비스 시작 중 오류가 발생했습니다", Toast.LENGTH_LONG).show()
             }
         }
 
         binding.btnStop.setOnClickListener {
             try {
-                if (isServerRunning) {
+                var stopCount = 0
+
+                if (isProxyRunning) {
                     stopProxy()
-                    stopStreaming()
-                } else {
-                    Log.w(TAG, "Server is not running")
+                    stopCount++
                 }
+
+                if (isStreamRunning) {
+                    stopStreaming()
+                    stopCount++
+                }
+
+                if (stopCount == 0) {
+                    Toast.makeText(this, "실행 중인 서비스가 없습니다", Toast.LENGTH_SHORT).show()
+                }
+
             } catch (e: Exception) {
-                Log.e(TAG, "Error stopping server", e)
+                Log.e(TAG, "Error stopping services", e)
+                Toast.makeText(this, "서비스 중지 중 오류가 발생했습니다", Toast.LENGTH_LONG).show()
             }
         }
+    }
 
-        wifiManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
-        channel = wifiManager.initialize(this, mainLooper, null)
-
-        permissionsLauncher.launch(
-            arrayOf(
-                Manifest.permission.ACCESS_WIFI_STATE,
-                Manifest.permission.CHANGE_WIFI_STATE,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.INTERNET,
-                Manifest.permission.CAMERA,
-                Manifest.permission.RECORD_AUDIO
-            )
+    private fun requestPermissions() {
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_WIFI_STATE,
+            Manifest.permission.CHANGE_WIFI_STATE,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.INTERNET,
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
         )
 
+        // Android 13+ 추가 권한
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+
+        permissionsLauncher.launch(permissions.toTypedArray())
+    }
+
+    private fun registerReceivers() {
+        // 시스템 브로드캐스트 등록
         val systemFilter = IntentFilter().apply {
             addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
+            addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
+            addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
         }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(wifiDirectReceiver, systemFilter, RECEIVER_NOT_EXPORTED)
         } else {
@@ -107,26 +220,33 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(wifiDirectReceiver, systemFilter)
         }
 
-        // 사용자 정의 브로드캐스트는 LocalBroadcastManager로 수신
+        // 로컬 브로드캐스트 등록
         val localFilter = IntentFilter().apply {
-            addAction("SERVER_STARTED")
-            addAction("SERVER_STOPPED")
+            addAction("PROXY_STARTED")
+            addAction("PROXY_STOPPED")
+            addAction("STREAM_STARTED")
+            addAction("STREAM_STOPPED")
         }
-        LocalBroadcastManager.getInstance(this).registerReceiver(wifiDirectReceiver, localFilter)
+        LocalBroadcastManager.getInstance(this).registerReceiver(localBroadcastReceiver, localFilter)
     }
 
     private fun startProxy(port: Int) {
         try {
-            if (::wifiDirectRTMPProxy.isInitialized) {
-                wifiDirectRTMPProxy.startProxy(port = port, rtmpUrl = youtubeRTMPUrl)
-                updateServerStatus(true, port)
-                Log.d(TAG, "Proxy started on port $port")
-            } else {
+            if (!::wifiDirectRTMPProxy.isInitialized) {
                 Log.e(TAG, "WiFiDirectRTMPProxy not initialized")
+                Toast.makeText(this, "프록시가 초기화되지 않았습니다", Toast.LENGTH_SHORT).show()
+                return
             }
+
+            wifiDirectRTMPProxy.startProxy(port = port, rtmpUrl = youtubeRTMPUrl)
+            updateProxyStatus(true, port)
+            Log.d(TAG, "Proxy started on port $port")
+            Toast.makeText(this, "프록시가 포트 $port 에서 시작되었습니다", Toast.LENGTH_SHORT).show()
+
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start proxy", e)
-            updateServerStatus(false, 0)
+            updateProxyStatus(false, 0)
+            Toast.makeText(this, "프록시 시작 실패: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -134,29 +254,47 @@ class MainActivity : AppCompatActivity() {
         try {
             if (::wifiDirectRTMPProxy.isInitialized) {
                 wifiDirectRTMPProxy.stopProxy()
-                updateServerStatus(false, 0)
+                updateProxyStatus(false, 0)
                 Log.d(TAG, "Proxy stopped")
+                Toast.makeText(this, "프록시가 중지되었습니다", Toast.LENGTH_SHORT).show()
             } else {
                 Log.e(TAG, "WiFiDirectRTMPProxy not initialized")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to stop proxy", e)
+            Toast.makeText(this, "프록시 중지 실패: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun updateServerStatus(isRunning: Boolean, port: Int) {
-        isServerRunning = isRunning
+    private fun updateProxyStatus(isRunning: Boolean, port: Int) {
+        isProxyRunning = isRunning
 
         if (isRunning) {
-            binding.tvServerStatus.text = "Server Status: Running on port $port"
-//            binding.statusIndicator.backgroundTintList = ColorStateList.valueOf(
-//                ContextCompat.getColor(this, R.color.status_active)
-//            )
+            binding.tvProxyStatus.text = "Proxy: Running on port $port"
+            binding.proxyStatusIndicator.backgroundTintList = ColorStateList.valueOf(
+                ContextCompat.getColor(this, android.R.color.holo_green_light)
+            )
         } else {
-            binding.tvServerStatus.text = "Server Status: Stopped"
-//            binding.statusIndicator.backgroundTintList = ColorStateList.valueOf(
-//                ContextCompat.getColor(this, R.color.status_inactive)
-//            )
+            binding.tvProxyStatus.text = "Proxy: Stopped"
+            binding.proxyStatusIndicator.backgroundTintList = ColorStateList.valueOf(
+                ContextCompat.getColor(this, android.R.color.darker_gray)
+            )
+        }
+    }
+
+    private fun updateStreamStatus(isRunning: Boolean) {
+        isStreamRunning = isRunning
+
+        if (isRunning) {
+            binding.tvStreamStatus.text = "Stream: Broadcasting"
+            binding.streamStatusIndicator.backgroundTintList = ColorStateList.valueOf(
+                ContextCompat.getColor(this, android.R.color.holo_red_light)
+            )
+        } else {
+            binding.tvStreamStatus.text = "Stream: Stopped"
+            binding.streamStatusIndicator.backgroundTintList = ColorStateList.valueOf(
+                ContextCompat.getColor(this, android.R.color.darker_gray)
+            )
         }
     }
 
@@ -164,9 +302,7 @@ class MainActivity : AppCompatActivity() {
         resetWifiState {
             clearPersistentGroups {
                 removeCurrentGroup {
-                    Handler(Looper.getMainLooper()).postDelayed(@androidx.annotation.RequiresPermission(
-                        allOf = [android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.NEARBY_WIFI_DEVICES]
-                    ) {
+                    Handler(Looper.getMainLooper()).postDelayed({
                         createWifiDirectGroup()
                     }, 1000)
                 }
@@ -246,11 +382,11 @@ class MainActivity : AppCompatActivity() {
         try {
             wifiManager.createGroup(channel, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
-                    Log.d(TAG, "✅ 그룹 생성됨")
+                    Log.d(TAG, "✅ Wi-Fi Direct 그룹 생성됨")
                 }
 
                 override fun onFailure(reason: Int) {
-                    Log.e(TAG, "❌ 그룹 생성 실패: $reason")
+                    Log.e(TAG, "❌ Wi-Fi Direct 그룹 생성 실패: $reason")
                 }
             })
         } catch (e: Exception) {
@@ -261,23 +397,27 @@ class MainActivity : AppCompatActivity() {
     private val wifiDirectReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             try {
-                if (intent?.action == WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION) {
-                    val group = intent.getParcelableExtra<WifiP2pGroup>(WifiP2pManager.EXTRA_WIFI_P2P_GROUP)
-                    if (group != null && group.isGroupOwner) {
-                        val ssid = group.networkName
-                        val pass = group.passphrase
-                        Log.d(TAG, "📡 그룹 정보 - SSID: $ssid, PASSWORD: $pass")
-                        // 화면에 띄우거나 QR 코드로 공유 가능
-                    }
-                }
                 when (intent?.action) {
-                    "SERVER_STARTED" -> {
-                        val port = intent.getIntExtra("port", 1081)
-                        Log.d(TAG, "📥 SERVER_STARTED received, port=$port")
-                        updateServerStatus(true, port)
+                    WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
+                        val group = intent.getParcelableExtra<WifiP2pGroup>(WifiP2pManager.EXTRA_WIFI_P2P_GROUP)
+                        if (group != null && group.isGroupOwner) {
+                            val ssid = group.networkName
+                            val pass = group.passphrase
+                            Log.d(TAG, "📡 Wi-Fi Direct 그룹 정보 - SSID: $ssid, PASSWORD: $pass")
+
+                            // 사용자에게 알림
+                            runOnUiThread {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "Wi-Fi Direct 그룹 생성됨\nSSID: $ssid",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
                     }
-                    "SERVER_STOPPED" -> {
-                        updateServerStatus(false, 0)
+                    WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
+                        val state = intent.getIntExtraCompatibility(WifiP2pManager.EXTRA_WIFI_STATE, -1)
+                        Log.d(TAG, "Wi-Fi P2P 상태 변경: $state")
                     }
                 }
             } catch (e: Exception) {
@@ -286,29 +426,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-
-        try {
-            // Stop proxy if running
-            if (isServerRunning && ::wifiDirectRTMPProxy.isInitialized) {
-                wifiDirectRTMPProxy.stopProxy()
-                Log.d(TAG, "WiFiDirectRTMPProxy stopped")
+    private val localBroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            try {
+                when (intent?.action) {
+                    "PROXY_STARTED" -> {
+                        val port = intent.getIntExtraCompatibility("port", 1081)
+                        Log.d(TAG, "📥 PROXY_STARTED received, port=$port")
+                        updateProxyStatus(true, port)
+                    }
+                    "PROXY_STOPPED" -> {
+                        Log.d(TAG, "📥 PROXY_STOPPED received")
+                        updateProxyStatus(false, 0)
+                    }
+                    "STREAM_STARTED" -> {
+                        Log.d(TAG, "📥 STREAM_STARTED received")
+                        updateStreamStatus(true)
+                    }
+                    "STREAM_STOPPED" -> {
+                        Log.d(TAG, "📥 STREAM_STOPPED received")
+                        updateStreamStatus(false)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in localBroadcastReceiver", e)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping proxy", e)
         }
+    }
 
-        try {
-            unregisterReceiver(wifiDirectReceiver)
+    private fun Intent.getIntExtraCompatibility(key: String, defaultValue: Int): Int {
+        return try {
+            getIntExtra(key, defaultValue)
         } catch (e: Exception) {
-            Log.e(TAG, "Error unregistering receiver", e)
-        }
-
-        try {
-            LocalBroadcastManager.getInstance(this).unregisterReceiver(wifiDirectReceiver)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error unregistering local receiver", e)
+            Log.w(TAG, "Failed to get int extra for key: $key", e)
+            defaultValue
         }
     }
 
@@ -316,29 +467,127 @@ class MainActivity : AppCompatActivity() {
         try {
             wifiDirectRTMPProxy = WiFiDirectRTMPProxy(this)
             streamManager = RTMPStreamManager()
-            Log.d(TAG, "WiFiDirectRTMPProxy initialized")
+            Log.d(TAG, "WiFiDirectRTMPProxy 초기화 완료")
 
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize proxy", e)
+            Log.e(TAG, "프록시 초기화 실패", e)
+            Toast.makeText(this, "프록시 초기화에 실패했습니다", Toast.LENGTH_LONG).show()
         }
     }
 
-    fun startStreaming() {
-        if (streamManager.isCurrentlyStreaming()) {
-            println("⚠️ 이미 스트리밍 중입니다")
-            return
+    private fun startStreaming() {
+        try {
+            if (!::streamManager.isInitialized) {
+                Log.e(TAG, "StreamManager not initialized")
+                Toast.makeText(this, "스트림 매니저가 초기화되지 않았습니다", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            if (streamManager.isCurrentlyStreaming()) {
+                Log.w(TAG, "⚠️ 이미 스트리밍 중입니다")
+                Toast.makeText(this, "이미 스트리밍 중입니다", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val selectedIndex = binding.spinnerVideo.selectedItemPosition
+            val selectedResId = videoList.getOrNull(selectedIndex)?.second ?: 0
+
+            if (selectedResId != 0) {
+                val cachedFile = copyRawToInternalStorage(this, selectedResId, "${videoList[selectedIndex].first}.mp4")
+                streamManager.startStream(this, cachedFile)
+                updateStreamStatus(true)
+                Toast.makeText(this, "스트리밍을 시작합니다", Toast.LENGTH_SHORT).show()
+            } else {
+                // 선택 안 됨 혹은 기본값
+                Toast.makeText(this, "비디오를 선택해주세요", Toast.LENGTH_SHORT).show()
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "스트리밍 시작 실패", e)
+            updateStreamStatus(false)
+            Toast.makeText(this, "스트리밍 시작 실패: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun copyRawToInternalStorage(context: Context, rawId: Int, fileName: String): File {
+        val outFile = File(context.filesDir, fileName)
+
+        // 이미 파일이 존재하면 삭제
+        if (outFile.exists()) {
+            outFile.delete()
         }
 
-        println("🚀 스트리밍 시작...")
-        streamManager.startStream(this)
+        try {
+            val inputStream = context.resources.openRawResource(rawId)
+            val outputStream = FileOutputStream(outFile)
+
+            inputStream.use { input ->
+                outputStream.use { output ->
+                    input.copyTo(output)
+                }
+            }
+
+            println("✅ Raw 파일 복사 완료: ${outFile.absolutePath}")
+            println("📁 파일 크기: ${outFile.length()} bytes")
+            println("📁 파일 존재: ${outFile.exists()}")
+
+            return outFile
+        } catch (e: Exception) {
+            println("❌ Raw 파일 복사 실패: ${e.message}")
+            throw e
+        }
     }
 
-    fun stopStreaming() {
-        println("🛑 스트리밍 중지...")
-        streamManager.stopStreamForcefully()
+    private fun stopStreaming() {
+        try {
+            if (::streamManager.isInitialized) {
+                Log.d(TAG, "🛑 스트리밍 중지...")
+                streamManager.stopStreamForcefully()
+                updateStreamStatus(false)
+                Toast.makeText(this, "스트리밍이 중지되었습니다", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "스트리밍 중지 실패", e)
+            Toast.makeText(this, "스트리밍 중지 실패: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
-    fun checkStatus() {
-        println("📊 현재 상태: ${streamManager.getStreamingStatus()}")
+    private fun checkStatus() {
+        try {
+            if (::streamManager.isInitialized) {
+                val status = streamManager.getStreamingStatus()
+                Log.d(TAG, "📊 현재 스트리밍 상태: $status")
+                Toast.makeText(this, "스트리밍 상태: $status", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "상태 확인 실패", e)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+
+        try {
+            // 실행 중인 서비스들 정리
+            if (isProxyRunning && ::wifiDirectRTMPProxy.isInitialized) {
+                wifiDirectRTMPProxy.stopProxy()
+                Log.d(TAG, "WiFiDirectRTMPProxy stopped")
+            }
+
+            if (isStreamRunning && ::streamManager.isInitialized) {
+                streamManager.stopStreamForcefully()
+                Log.d(TAG, "StreamManager stopped")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping services", e)
+        }
+
+        try {
+            // 브로드캐스트 리시버 해제
+            unregisterReceiver(wifiDirectReceiver)
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(localBroadcastReceiver)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unregistering receivers", e)
+        }
     }
 }

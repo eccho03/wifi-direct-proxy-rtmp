@@ -1,6 +1,7 @@
 package com.example.wifidirectproxysocks
 
 import android.content.Context
+import android.widget.Toast
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.FFmpegSession
@@ -17,7 +18,7 @@ class RTMPStreamManager {
     private val currentSession = AtomicReference<FFmpegSession?>(null)
     private var isStreaming = false
 
-    fun startStream(context: Context) {
+    fun startStream(context: Context, inputFile: File) {
         // 0. 스트림키 받아오기
         val STREAM_KEY = BuildConfig.STREAMING_KEY
 
@@ -27,16 +28,11 @@ class RTMPStreamManager {
         // 2. 잠시 대기 (YouTube 서버가 이전 연결을 정리할 시간)
         Thread.sleep(3000)
 
-        val inputFile = File(context.filesDir, "game.mp4")
         if (!inputFile.exists()) {
-            try {
-                copyRawToInternalStorage(context, R.raw.game, "game.mp4")
-            }
-            catch (e: Exception) {
-                println("❌ 파일 복사 실패: ${e.message}")
-                createAndStreamTestVideo(context)
-            }
+            println("❌ 입력 파일이 존재하지 않음: ${inputFile.absolutePath}")
+            return
         }
+
         val probeCommand = listOf(
             "-i", inputFile.absolutePath,
             "-hide_banner"
@@ -45,7 +41,7 @@ class RTMPStreamManager {
         val probeSession = FFmpegKit.execute(probeCommand)
         val output = probeSession.allLogsAsString
 
-// 오디오 트랙 있는지 확인
+        // 오디오 트랙 있는지 확인
         val hasAudio = output.contains("Stream #") && output.contains("Audio")
         val durationRegex = Regex("Duration: (\\d+):(\\d+):(\\d+\\.\\d+)")
         val durationMatch = durationRegex.find(output)
@@ -59,8 +55,16 @@ class RTMPStreamManager {
 
         println("🧪 FFmpeg 분석 결과: 오디오=$hasAudio, 길이=${"%.1f".format(durationSeconds)}초")
 
-        if (!hasAudio || durationSeconds < 5.0) {
-            println("⚠️ 입력 영상이 무음이거나 너무 짧음 → 테스트 스트림으로 대체")
+        if (!hasAudio) {
+            println("⚠️ 입력 영상이 무음 → 테스트 스트림으로 대체")
+            Toast.makeText(MainActivity(), "입력 영상이 무음 → 테스트 스트림으로 대체됩니다", Toast.LENGTH_LONG).show()
+            createAndStreamTestVideo(context)
+            return
+        }
+
+        if (durationSeconds < 5.0) {
+            println("⚠️ 입력 영상이 너무 짧음 → 테스트 스트림으로 대체")
+            Toast.makeText(MainActivity(), "입력 영상이 너무 짧음 → 테스트 스트림으로 대체됩니다", Toast.LENGTH_LONG).show()
             createAndStreamTestVideo(context)
             return
         }
@@ -223,36 +227,6 @@ class RTMPStreamManager {
                 println("  ❓ 알 수 없는 오류")
                 println("  📋 최근 로그: ${logs.takeLast(500)}")
             }
-        }
-    }
-
-
-    fun copyRawToInternalStorage(context: Context, rawId: Int, fileName: String): File {
-        val outFile = File(context.filesDir, fileName)
-
-        // 이미 파일이 존재하면 삭제
-        if (outFile.exists()) {
-            outFile.delete()
-        }
-
-        try {
-            val inputStream = context.resources.openRawResource(rawId)
-            val outputStream = FileOutputStream(outFile)
-
-            inputStream.use { input ->
-                outputStream.use { output ->
-                    input.copyTo(output)
-                }
-            }
-
-            println("✅ Raw 파일 복사 완료: ${outFile.absolutePath}")
-            println("📁 파일 크기: ${outFile.length()} bytes")
-            println("📁 파일 존재: ${outFile.exists()}")
-
-            return outFile
-        } catch (e: Exception) {
-            println("❌ Raw 파일 복사 실패: ${e.message}")
-            throw e
         }
     }
 
