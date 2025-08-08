@@ -24,6 +24,10 @@ class SocksProxyServer(private val port: Int) {
     private val connectionCounter = AtomicInteger(0)
     private val maxConnections = 100 // Limit concurrent connections
 
+    /**
+     * Starts the SOCKS5 proxy server on the specified port.
+     * Accepts client connections, performs handshake, and relays traffic.
+     */
     fun start() {
         serverScope.launch {
             try {
@@ -79,6 +83,10 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Handles a single client connection including SOCKS5 handshake and request parsing.
+     * @param clientSocket The incoming client socket connection.
+     */
     private suspend fun handleClient(clientSocket: Socket) {
         withContext(Dispatchers.IO) {
             val connectionId = "conn-${connectionCounter.incrementAndGet()}"
@@ -185,6 +193,15 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Handles the SOCKS5 CONNECT command and attempts to establish a TCP connection
+     * to the requested remote address and port.
+     * @param host The target hostname or IP address.
+     * @param port The target port number.
+     * @param output Output stream to send SOCKS5 response.
+     * @param clientSocket The client's socket.
+     * @param connectionId A unique connection identifier for logging.
+     */
     private fun handleConnectStrict(host: String, port: Int, output: OutputStream, clientSocket: Socket, connectionId: String) {
         var targetSocket: Socket? = null
         try {
@@ -227,6 +244,11 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Sends a SOCKS5 error response to the client.
+     * @param output Output stream to write the error response to.
+     * @param errorCode SOCKS5 error code to return.
+     */
     private fun sendErrorResponse(output: OutputStream, errorCode: Byte) {
         try {
             val response = byteArrayOf(0x05, errorCode, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
@@ -237,6 +259,12 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Parses a SOCKS5 address field from a request.
+     * @param buffer The buffer containing the SOCKS request.
+     * @param addressType The address type byte (IPv4, domain, etc.).
+     * @return A pair of the parsed address and port.
+     */
     private fun parseAddress(buffer: ByteArray, addressType: Byte): Pair<String, Int> {
         when (addressType) {
             0x01.toByte() -> { // IPv4
@@ -258,6 +286,13 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Starts bidirectional data relay between the client and the target server.
+     * @param clientSocket The client socket.
+     * @param targetSocket The target socket.
+     * @param connectionId A unique ID for this connection.
+     * @param connectionKey A key used to track the active connection.
+     */
     private fun startRelay(clientSocket: Socket, targetSocket: Socket, connectionId: String, connectionKey: String) {
         // 개별 스코프로 릴레이 작업 격리
         val relayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -308,6 +343,16 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Performs data relay from one socket to another.
+     * Reads data from input and writes to output until sockets close or an error occurs.
+     * @param from Input stream to read from.
+     * @param to Output stream to write to.
+     * @param direction Description of the data direction (for logging).
+     * @param connectionId Connection ID for debugging/logging.
+     * @param clientSocket The client socket.
+     * @param targetSocket The target socket.
+     */
     private suspend fun relayData(
         from: java.io.InputStream,
         to: java.io.OutputStream,
@@ -376,6 +421,13 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Cleans up a finished or failed connection by closing sockets and removing tracking info.
+     * @param clientSocket The client socket.
+     * @param targetSocket The target server socket.
+     * @param connectionId A unique connection ID.
+     * @param connectionKey Key used to remove from active connections.
+     */
     private fun cleanupConnection(clientSocket: Socket, targetSocket: Socket, connectionId: String, connectionKey: String) {
         println("[$connectionId] Starting connection cleanup...")
 
@@ -414,6 +466,10 @@ class SocksProxyServer(private val port: Int) {
         println("[$connectionId] Connection cleanup completed")
     }
 
+    /**
+     * Cleans up a single client socket, usually after failed handshake or errors.
+     * @param clientSocket The client socket to close and remove.
+     */
     private fun cleanup(clientSocket: Socket) {
         clientSockets.remove(clientSocket)
         try {
@@ -425,6 +481,10 @@ class SocksProxyServer(private val port: Int) {
         }
     }
 
+    /**
+     * Stops the SOCKS proxy server and releases all resources.
+     * Closes all sockets, cancels coroutines, and clears active connections.
+     */
     fun stop() {
         println("Stopping SOCKS proxy server...")
         isRunning = false
@@ -462,18 +522,35 @@ class SocksProxyServer(private val port: Int) {
         println("SOCKS proxy server stopped")
     }
 
+    /**
+     * Returns the current number of active SOCKS connections.
+     * @return Active connection count.
+     */
     fun getConnectionCount(): Int {
         return activeConnections.size
     }
 
+    /**
+     * Returns the number of client sockets currently managed by the server.
+     * @return Number of client sockets.
+     */
     fun getClientSocketCount(): Int {
         return clientSockets.size
     }
 
+    /**
+     * Returns whether the server is currently running.
+     * @return True if the server is running, false otherwise.
+     */
     fun isServerRunning(): Boolean {
         return isRunning
     }
 
+    /**
+     * Returns a human-readable status of the SOCKS proxy server.
+     * Includes port and connection info if running.
+     * @return Status string.
+     */
     fun getServerStatus(): String {
         return if (isRunning) {
             "Running on port $port (${activeConnections.size} active connections)"

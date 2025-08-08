@@ -13,11 +13,21 @@ import java.io.FileOutputStream
 import java.io.BufferedReader
 import java.io.InputStreamReader
 
-
+/**
+ * Manages RTMP streaming using FFmpegKit.
+ * Supports streaming video files or test patterns to an RTMP server (e.g., YouTube Live).
+ */
 class RTMPStreamManager {
     private val currentSession = AtomicReference<FFmpegSession?>(null)
     private var isStreaming = false
 
+    /**
+     * Starts an RTMP stream using the provided video file.
+     * If the video has no audio or is too short, a test stream is used instead.
+     *
+     * @param context The application context for showing UI messages.
+     * @param inputFile The input video file to stream.
+     */
     fun startStream(context: Context, inputFile: File) {
         // 0. 스트림키 받아오기
         val STREAM_KEY = BuildConfig.STREAMING_KEY
@@ -152,6 +162,10 @@ class RTMPStreamManager {
         }.start()
     }
 
+    /**
+     * Forcefully stops any ongoing RTMP streaming session.
+     * Cancels the current session and all FFmpeg sessions.
+     */
     fun stopStreamForcefully() {
         println("🛑 기존 스트리밍 강제 종료 중...")
 
@@ -180,6 +194,10 @@ class RTMPStreamManager {
         println("✅ 스트리밍 정리 완료")
     }
 
+    /**
+     * Checks the health/status of the ongoing streaming session.
+     * Prints the current session's logs and diagnostics.
+     */
     private fun checkStreamingHealth() {
         val session = currentSession.get()
         if (session != null && isStreaming) {
@@ -199,6 +217,11 @@ class RTMPStreamManager {
         }
     }
 
+    /**
+     * Analyzes FFmpeg logs to detect and explain possible streaming errors.
+     *
+     * @param logs The raw FFmpeg logs from the session.
+     */
     private fun analyzeStreamingError(logs: String) {
         println("🔍 스트리밍 오류 분석:")
 
@@ -230,6 +253,12 @@ class RTMPStreamManager {
         }
     }
 
+    /**
+     * Creates and streams a test video pattern (color bars and sine audio)
+     * when the input video is invalid or not suitable for streaming.
+     *
+     * @param context The application context used for notifications or logging.
+     */
     private fun createAndStreamTestVideo(context: Context) {
         println("🎬 테스트 비디오 생성 후 스트리밍...")
         val STREAM_KEY = BuildConfig.STREAMING_KEY
@@ -272,6 +301,11 @@ class RTMPStreamManager {
         isStreaming = true
     }
 
+    /**
+     * Returns a human-readable string indicating the current streaming status.
+     *
+     * @return A string showing whether streaming is active or stopped.
+     */
     fun getStreamingStatus(): String {
         return if (isStreaming) {
             val session = currentSession.get()
@@ -281,5 +315,10 @@ class RTMPStreamManager {
         }
     }
 
+    /**
+     * Returns whether an RTMP stream is currently running.
+     *
+     * @return `true` if streaming is active, `false` otherwise.
+     */
     fun isCurrentlyStreaming(): Boolean = isStreaming
 }
