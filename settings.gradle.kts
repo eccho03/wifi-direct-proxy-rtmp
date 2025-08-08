@@ -22,4 +22,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "WifiDirectProxySocks"
 include(":app")
- 
+include(":wifidirectproxysocks")

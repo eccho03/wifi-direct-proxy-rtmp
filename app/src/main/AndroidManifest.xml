@@ -33,10 +33,10 @@
             </intent-filter>
         </activity>
 
-<!--        <service-->
-<!--            android:name=".SocksProxyService"-->
-<!--            android:exported="false"-->
-<!--            android:foregroundServiceType="dataSync" />-->
+        <!--        <service-->
+        <!--            android:name=".SocksProxyService"-->
+        <!--            android:exported="false"-->
+        <!--            android:foregroundServiceType="dataSync" />-->
 
     </application>
 
