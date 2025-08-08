@@ -18,6 +18,11 @@ class RTMPStreamManager {
     private val currentSession = AtomicReference<FFmpegSession?>(null)
     private var isStreaming = false
 
+    /**
+     * RTMP 스트리밍 시작
+     * @param context
+     * @param inputFile 스트리밍할 비디오 파일 (재생할 수 없는 경우 테스트 스트림 생성)
+     */
     fun startStream(context: Context, inputFile: File) {
         // 0. 스트림키 받아오기
         val STREAM_KEY = BuildConfig.STREAMING_KEY
@@ -152,6 +157,9 @@ class RTMPStreamManager {
         }.start()
     }
 
+    /**
+     * 기존 RTMP 스트리밍 강제 종료
+     */
     fun stopStreamForcefully() {
         println("🛑 기존 스트리밍 강제 종료 중...")
 
@@ -180,6 +188,9 @@ class RTMPStreamManager {
         println("✅ 스트리밍 정리 완료")
     }
 
+    /**
+     * 스트리밍 상태 확인
+     */
     private fun checkStreamingHealth() {
         val session = currentSession.get()
         if (session != null && isStreaming) {
@@ -199,6 +210,10 @@ class RTMPStreamManager {
         }
     }
 
+    /**
+     * 스트리밍 오류 분석 로그
+     * @param logs 로그에 어떤 정보가 들어있는지에 따라 분석
+     */
     private fun analyzeStreamingError(logs: String) {
         println("🔍 스트리밍 오류 분석:")
 
@@ -230,6 +245,10 @@ class RTMPStreamManager {
         }
     }
 
+    /**
+     * 테스트용 송출 영상 생성
+     * @param context 현재 context
+     */
     private fun createAndStreamTestVideo(context: Context) {
         println("🎬 테스트 비디오 생성 후 스트리밍...")
         val STREAM_KEY = BuildConfig.STREAMING_KEY
@@ -272,6 +291,9 @@ class RTMPStreamManager {
         isStreaming = true
     }
 
+    /**
+     * 스트리밍 여부
+     */
     fun getStreamingStatus(): String {
         return if (isStreaming) {
             val session = currentSession.get()
@@ -281,5 +303,8 @@ class RTMPStreamManager {
         }
     }
 
+    /**
+     * 스트리밍 중인지
+     */
     fun isCurrentlyStreaming(): Boolean = isStreaming
 }
