@@ -66,7 +66,7 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
 
     implementation("com.arthenica:smart-exception-java:0.2.1")
-    implementation("com.arthenica:ffmpeg-kit-full-gpl:6.0-2.LTS@aar")
+    implementation(files("libs/ffmpeg-kit-full-gpl-6.0-2.LTS.aar"))
     implementation("androidx.localbroadcastmanager:localbroadcastmanager:1.1.0")
 
 }

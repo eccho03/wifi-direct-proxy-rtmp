@@ -149,12 +149,12 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this, "프록시가 이미 실행 중입니다", Toast.LENGTH_SHORT).show()
                 }
 
-                if (!isStreamRunning) {
-                    startStreaming()
-                } else {
-                    Log.w(TAG, "Stream is already running")
-                    Toast.makeText(this, "스트리밍이 이미 실행 중입니다", Toast.LENGTH_SHORT).show()
-                }
+//                if (!isStreamRunning) {
+//                    startStreaming()
+//                } else {
+//                    Log.w(TAG, "Stream is already running")
+//                    Toast.makeText(this, "스트리밍이 이미 실행 중입니다", Toast.LENGTH_SHORT).show()
+//                }
 
             } catch (e: Exception) {
                 Log.e(TAG, "Error starting services", e)
@@ -272,12 +272,12 @@ class MainActivity : AppCompatActivity() {
         if (isRunning) {
             binding.tvProxyStatus.text = "Proxy: Running on port $port"
             binding.proxyStatusIndicator.backgroundTintList = ColorStateList.valueOf(
-                ContextCompat.getColor(this, android.R.color.holo_green_light)
+                ContextCompat.getColor(this, R.color.status_active)
             )
         } else {
             binding.tvProxyStatus.text = "Proxy: Stopped"
             binding.proxyStatusIndicator.backgroundTintList = ColorStateList.valueOf(
-                ContextCompat.getColor(this, android.R.color.darker_gray)
+                ContextCompat.getColor(this, R.color.status_inactive)
             )
         }
     }
@@ -288,12 +288,12 @@ class MainActivity : AppCompatActivity() {
         if (isRunning) {
             binding.tvStreamStatus.text = "Stream: Broadcasting"
             binding.streamStatusIndicator.backgroundTintList = ColorStateList.valueOf(
-                ContextCompat.getColor(this, android.R.color.holo_red_light)
+                ContextCompat.getColor(this, R.color.status_active)
             )
         } else {
             binding.tvStreamStatus.text = "Stream: Stopped"
             binding.streamStatusIndicator.backgroundTintList = ColorStateList.valueOf(
-                ContextCompat.getColor(this, android.R.color.darker_gray)
+                ContextCompat.getColor(this, R.color.status_inactive)
             )
         }
     }
