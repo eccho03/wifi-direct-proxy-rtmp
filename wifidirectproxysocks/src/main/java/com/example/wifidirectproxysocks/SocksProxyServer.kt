@@ -1,525 +1,796 @@
 package com.example.wifidirectproxysocks
 
-import kotlinx.coroutines.*
-import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.ServerSocket
-import java.net.Socket
+import java.net.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
-import java.text.SimpleDateFormat
-import java.util.*
-import java.util.regex.Pattern
 
-class EnhancedSocksProxyServer(private val port: Int, private val enableDebugLog: Boolean = false) {
+class SocksProxyServer(private val port: Int) {
     private var serverSocket: ServerSocket? = null
+    private var udpSocket: DatagramSocket? = null
     private var isRunning = false
     private val serverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val activeConnections = ConcurrentHashMap<String, ConnectionInfo>()
+    private val activeConnections = ConcurrentHashMap<String, Pair<Socket, Socket>>()
+    private val udpAssociations = ConcurrentHashMap<String, UdpAssociation>()
+    private val udpTargetMappings = ConcurrentHashMap<String, String>() // target -> client mapping
     private val clientSockets = mutableSetOf<Socket>()
     private val connectionCounter = AtomicInteger(0)
-    private val maxConnections = 100
-    private val totalBytesTransferred = AtomicLong(0)
-    private val dateFormatter = SimpleDateFormat("HH:mm:ss.SSS")
+    private val maxConnections = 100 // Limit concurrent connections
 
-    // Web application specific patterns
-    private val webAppDomains = setOf(
-        "youtube.com", "googlevideo.com", "googleapis.com", "gstatic.com",
-        "doubleclick.net", "googleadservices.com", "googletagmanager.com",
-        "google-analytics.com", "googletagservices.com"
+    data class UdpAssociation(
+        val clientAddress: InetAddress,
+        val clientPort: Int,
+        val udpRelaySocket: DatagramSocket,
+        val associationId: String,
+        var targetAddress: InetAddress? = null,
+        var targetPort: Int? = null
     )
 
-    data class ConnectionInfo(
-        val clientSocket: Socket,
-        val targetSocket: Socket,
-        val startTime: Long,
-        val bytesTransferred: AtomicLong = AtomicLong(0),
-        val host: String,
-        val port: Int,
-        val isWebApp: Boolean = false
-    )
-
-    data class ConnectionStats(
-        var totalConnections: Int = 0,
-        var activeConnections: Int = 0,
-        var failedConnections: Int = 0,
-        var webAppConnections: Int = 0,
-        var bytesTransferred: Long = 0
-    )
-
+    /**
+     * Starts the SOCKS5 proxy server on the specified port.
+     * Accepts client connections, performs handshake, and relays traffic.
+     */
     fun start() {
-        if (isRunning) {
-            println("Server is already running")
-            return
-        }
-
         serverScope.launch {
             try {
-                serverSocket = ServerSocket(port).apply {
-                    reuseAddress = true
-                    soTimeout = 1000
-                    receiveBufferSize = 65536
-                }
+                serverSocket = ServerSocket(port)
+                serverSocket?.reuseAddress = true
+                serverSocket?.soTimeout = 1000 // 1초 타임아웃으로 주기적 체크
+                serverSocket?.receiveBufferSize = 32768 // 버퍼 크기 증가
+
+                // UDP 릴레이용 소켓 초기화
+                udpSocket = DatagramSocket()
+                udpSocket?.reuseAddress = true
+                udpSocket?.soTimeout = 1000
+                udpSocket?.receiveBufferSize = 65536 // UDP 버퍼 크기 증가
+                udpSocket?.sendBufferSize = 65536
+
                 isRunning = true
-                println("Enhanced SOCKS5 proxy server started on port $port")
-                if (enableDebugLog) {
-                    println("Debug logging enabled")
-                }
+                println("SOCKS proxy server started on port $port")
+                println("UDP relay socket bound to port ${udpSocket?.localPort}")
 
-                // Start monitoring coroutine
-                launch { monitorConnections() }
+                // UDP 릴레이 처리 시작
+                launch { handleUdpRelay() }
 
+                // TCP 클라이언트 연결 처리
                 while (isRunning && serverScope.isActive) {
                     try {
-                        if (activeConnections.size >= maxConnections) {
-                            debugLog("Maximum connections reached ($maxConnections), waiting...")
-                            delay(100)
-                            continue
-                        }
-
                         val clientSocket = serverSocket?.accept()
-                        clientSocket?.let { socket ->
-                            configureSocket(socket, isClient = true)
-                            clientSockets.add(socket)
-
-                            launch(Dispatchers.IO + SupervisorJob()) {
-                                try {
-                                    handleClient(socket)
-                                } catch (e: Exception) {
-                                    debugLog("Error in client handler: ${e.message}")
-                                    cleanup(socket)
-                                }
-                            }
+                        if (clientSocket != null) {
+                            clientSockets.add(clientSocket)
+                            launch { handleClient(clientSocket) }
                         }
-                    } catch (e: java.net.SocketTimeoutException) {
+                    } catch (e: SocketTimeoutException) {
+                        // 정상적인 타임아웃
                         continue
                     } catch (e: Exception) {
                         if (isRunning) {
-                            debugLog("Error accepting client: ${e.message}")
-                            delay(50)
+                            println("Accept error: ${e.message}")
                         }
                     }
                 }
-                println("Enhanced SOCKS proxy server stopped")
+
+                println("SOCKS proxy server stopped")
             } catch (e: Exception) {
                 println("SOCKS proxy server error: ${e.message}")
             }
         }
     }
 
-    private fun configureSocket(socket: Socket, isClient: Boolean = false) {
-        socket.apply {
-            keepAlive = true
-            tcpNoDelay = true
+    /**
+     * Handles UDP relay for SOCKS5 UDP ASSOCIATE
+     */
+    private suspend fun handleUdpRelay() {
+        withContext(Dispatchers.IO) {
+            val buffer = ByteArray(65507) // Maximum UDP packet size
 
-            // Different timeouts for client vs target connections
-            soTimeout = if (isClient) 60000 else 30000
+            while (isRunning && serverScope.isActive) {
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    udpSocket?.receive(packet)
 
-            // Larger buffers for better web app performance
-            receiveBufferSize = 131072 // 128KB
-            sendBufferSize = 131072
-
-            try {
-                // Prioritize low latency for web apps
-                setPerformancePreferences(0, 1, 2)
-            } catch (e: Exception) {
-                // Ignore if not supported
+                    launch {
+                        try {
+                            processUdpPacket(packet)
+                        } catch (e: Exception) {
+                            println("Error processing UDP packet: ${e.message}")
+                        }
+                    }
+                } catch (e: SocketTimeoutException) {
+                    // 정상적인 타임아웃
+                    continue
+                } catch (e: Exception) {
+                    if (isRunning) {
+                        println("UDP relay error: ${e.message}")
+                        kotlinx.coroutines.delay(100)
+                    }
+                }
             }
         }
     }
 
-    private suspend fun handleClient(clientSocket: Socket) = withContext(Dispatchers.IO) {
-        val connectionId = "conn-${connectionCounter.incrementAndGet()}"
-        debugLog("[$connectionId] New client connection from ${clientSocket.inetAddress}")
+    /**
+     * Processes incoming UDP packet and forwards it accordingly
+     */
+    private suspend fun processUdpPacket(packet: DatagramPacket) {
+        withContext(Dispatchers.IO) {
+            val sourceAddress = packet.address
+            val sourcePort = packet.port
+            val data = packet.data.copyOfRange(0, packet.length)
 
-        try {
-            val input = clientSocket.getInputStream()
-            val output = clientSocket.getOutputStream()
+            // Check if this is from a known client
+            val associationKey = "$sourceAddress:$sourcePort"
+            val association = udpAssociations[associationKey]
 
-            if (!performHandshake(input, output, connectionId)) {
-                cleanup(clientSocket)
-                return@withContext
+            if (association != null) {
+                // Parse SOCKS5 UDP request format
+                if (data.size < 10) {
+                    println("UDP packet too small: ${data.size} bytes")
+                    return@withContext
+                }
+
+                try {
+                    val parsedRequest = parseUdpRequest(data)
+                    if (parsedRequest != null) {
+                        // Forward to target
+                        forwardUdpToTarget(parsedRequest, association, sourceAddress, sourcePort)
+                    }
+                } catch (e: Exception) {
+                    println("Error parsing UDP request: ${e.message}")
+                }
+            } else {
+                // Check if this is a response from a target server
+                handleUdpResponse(packet)
             }
-
-            handleSocksRequest(input, output, clientSocket, connectionId)
-
-        } catch (e: Exception) {
-            debugLog("[$connectionId] Client handling error: ${e.message}")
-            cleanup(clientSocket)
         }
     }
 
-    private suspend fun performHandshake(input: InputStream, output: OutputStream, connectionId: String): Boolean {
-        return try {
-            withTimeout(10000) { // Longer timeout for web apps
-                val handshakeHeader = ByteArray(2)
-                if (input.read(handshakeHeader) != 2 || handshakeHeader[0] != 0x05.toByte()) {
-                    debugLog("[$connectionId] Invalid SOCKS5 handshake")
-                    return@withTimeout false
-                }
+    data class UdpRequest(
+        val targetAddress: String,
+        val targetPort: Int,
+        val payload: ByteArray
+    )
 
-                val nMethods = handshakeHeader[1].toInt() and 0xFF
-                if (nMethods <= 0) {
-                    debugLog("[$connectionId] No authentication methods provided")
-                    return@withTimeout false
-                }
+    /**
+     * Parses SOCKS5 UDP request format
+     */
+    private fun parseUdpRequest(data: ByteArray): UdpRequest? {
+        if (data.size < 10) return null
 
-                val methods = ByteArray(nMethods)
-                if (input.read(methods) != nMethods) {
-                    debugLog("[$connectionId] Could not read all authentication methods")
-                    return@withTimeout false
-                }
+        // SOCKS5 UDP request format:
+        // +----+------+------+----------+----------+----------+
+        // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+        // +----+------+------+----------+----------+----------+
+        // | 2  |  1   |  1   | Variable |    2     | Variable |
+        // +----+------+------+----------+----------+----------+
 
-                // Reply: no authentication required
-                output.write(byteArrayOf(0x05, 0x00))
-                output.flush()
-                debugLog("[$connectionId] Handshake completed successfully")
-                true
-            }
-        } catch (e: Exception) {
-            debugLog("[$connectionId] Handshake error: ${e.message}")
-            false
+        val rsv = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
+        val frag = data[2].toInt() and 0xFF
+        val atyp = data[3].toInt() and 0xFF
+
+        if (rsv != 0 || frag != 0) {
+            println("Invalid UDP request: RSV=$rsv, FRAG=$frag")
+            return null
         }
-    }
 
-    private suspend fun handleSocksRequest(
-        input: InputStream,
-        output: OutputStream,
-        clientSocket: Socket,
-        connectionId: String
-    ) {
-        try {
-            withTimeout(15000) { // Extended timeout for complex requests
-                val reqHeader = ByteArray(4)
-                if (input.read(reqHeader) != 4) {
-                    debugLog("[$connectionId] Could not read request header")
-                    sendErrorResponse(output, 0x01)
-                    return@withTimeout
-                }
+        var offset = 4
+        val targetAddress: String
+        val targetPort: Int
 
-                val version = reqHeader[0]
-                val cmd = reqHeader[1]
-                val atyp = reqHeader[3]
-
-                if (version != 0x05.toByte()) {
-                    debugLog("[$connectionId] Invalid SOCKS version: $version")
-                    sendErrorResponse(output, 0x01)
-                    return@withTimeout
-                }
-
-                if (cmd != 0x01.toByte()) {
-                    debugLog("[$connectionId] Unsupported command: $cmd")
-                    sendErrorResponse(output, 0x07)
-                    return@withTimeout
-                }
-
-                val (address, port) = parseAddressAndPort(input, atyp, connectionId)
-                    ?: run {
-                        sendErrorResponse(output, 0x01)
-                        return@withTimeout
-                    }
-
-                debugLog("[$connectionId] CONNECT request to $address:$port")
-                handleConnect(address, port, output, clientSocket, connectionId)
+        when (atyp) {
+            0x01 -> { // IPv4
+                if (data.size < offset + 6) return null
+                targetAddress = "${data[offset].toUByte()}.${data[offset+1].toUByte()}.${data[offset+2].toUByte()}.${data[offset+3].toUByte()}"
+                offset += 4
             }
-        } catch (e: Exception) {
-            debugLog("[$connectionId] Request handling error: ${e.message}")
-            sendErrorResponse(output, 0x01)
-        }
-    }
-
-    private suspend fun parseAddressAndPort(
-        input: InputStream,
-        atyp: Byte,
-        connectionId: String
-    ): Pair<String, Int>? {
-        return try {
-            val address = when (atyp.toInt()) {
-                0x01 -> { // IPv4
-                    val addr = ByteArray(4)
-                    if (input.read(addr) != 4) {
-                        debugLog("[$connectionId] Could not read IPv4 address")
-                        return null
-                    }
-                    addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
-                }
-                0x03 -> { // Domain
-                    val len = input.read()
-                    if (len <= 0 || len > 255) {
-                        debugLog("[$connectionId] Invalid domain length: $len")
-                        return null
-                    }
-                    val addr = ByteArray(len)
-                    if (input.read(addr) != len) {
-                        debugLog("[$connectionId] Could not read domain name")
-                        return null
-                    }
-                    String(addr, Charsets.UTF_8)
-                }
-                0x04 -> { // IPv6
-                    val addr = ByteArray(16)
-                    if (input.read(addr) != 16) {
-                        debugLog("[$connectionId] Could not read IPv6 address")
-                        return null
-                    }
-                    java.net.InetAddress.getByAddress(addr).hostAddress
-                }
-                else -> {
-                    debugLog("[$connectionId] Unsupported address type: $atyp")
-                    return null
-                }
+            0x03 -> { // Domain
+                if (data.size < offset + 1) return null
+                val domainLen = data[offset].toUByte().toInt()
+                offset += 1
+                if (data.size < offset + domainLen + 2) return null
+                targetAddress = String(data.sliceArray(offset until offset + domainLen))
+                offset += domainLen
             }
-
-            val portBytes = ByteArray(2)
-            if (input.read(portBytes) != 2) {
-                debugLog("[$connectionId] Could not read port")
+            0x04 -> { // IPv6
+                if (data.size < offset + 18) return null
+                val addr = data.sliceArray(offset until offset + 16)
+                targetAddress = InetAddress.getByAddress(addr).hostAddress
+                offset += 16
+            }
+            else -> {
+                println("Unsupported address type: $atyp")
                 return null
             }
-            val port = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
+        }
 
-            Pair(address, port)
-        } catch (e: Exception) {
-            debugLog("[$connectionId] Error parsing address: ${e.message}")
-            null
+        if (data.size < offset + 2) return null
+        targetPort = ((data[offset].toInt() and 0xFF) shl 8) or (data[offset+1].toInt() and 0xFF)
+        offset += 2
+
+        val payload = if (offset < data.size) {
+            data.sliceArray(offset until data.size)
+        } else {
+            ByteArray(0)
+        }
+
+        return UdpRequest(targetAddress, targetPort, payload)
+    }
+
+    /**
+     * Forwards UDP packet to target server
+     */
+    private suspend fun forwardUdpToTarget(request: UdpRequest, association: UdpAssociation, clientAddress: InetAddress, clientPort: Int) {
+        withContext(Dispatchers.IO) {
+            try {
+                val targetAddress = InetAddress.getByName(request.targetAddress)
+                
+                // Update association with target info
+                association.targetAddress = targetAddress
+                association.targetPort = request.targetPort
+                
+                // Create mapping for responses
+                val targetKey = "$targetAddress:${request.targetPort}"
+                val clientKey = "$clientAddress:$clientPort"
+                udpTargetMappings[targetKey] = clientKey
+
+                val targetPacket = DatagramPacket(
+                    request.payload,
+                    request.payload.size,
+                    targetAddress,
+                    request.targetPort
+                )
+
+                println("[${association.associationId}] Forwarding UDP to ${request.targetAddress}:${request.targetPort} (${request.payload.size} bytes)")
+                udpSocket?.send(targetPacket)
+
+            } catch (e: Exception) {
+                println("Error forwarding UDP to target: ${e.message}")
+            }
         }
     }
 
-    private suspend fun handleConnect(
-        host: String,
-        port: Int,
-        output: OutputStream,
-        clientSocket: Socket,
-        connectionId: String
-    ) {
-        var targetSocket: Socket? = null
-        val isWebApp = isWebAppDomain(host)
-
+    /**
+     * Handles UDP response from target server
+     */
+    private fun handleUdpResponse(packet: DatagramPacket) {
         try {
-            debugLog("[$connectionId] Connecting to $host:$port (WebApp: $isWebApp)")
+            val sourceAddress = packet.address
+            val sourcePort = packet.port
+            val responseData = packet.data.copyOfRange(0, packet.length)
 
-            val connectTimeout = when {
-                isWebApp -> 25000 // Extra time for web apps
-                port == 443 -> 20000 // HTTPS
-                port == 80 -> 15000  // HTTP
-                else -> 10000
+            // Find the client that should receive this response
+            val targetKey = "$sourceAddress:$sourcePort"
+            val clientKey = udpTargetMappings[targetKey]
+
+            if (clientKey != null) {
+                // Parse client address and port
+                val parts = clientKey.split(":")
+                if (parts.size == 2) {
+                    val clientAddress = InetAddress.getByName(parts[0])
+                    val clientPort = parts[1].toInt()
+
+                    // Create SOCKS5 UDP response format
+                    val socksResponse = createUdpResponse(sourceAddress.hostAddress, sourcePort, responseData)
+
+                    val clientPacket = DatagramPacket(
+                        socksResponse,
+                        socksResponse.size,
+                        clientAddress,
+                        clientPort
+                    )
+
+                    println("Forwarding UDP response from $sourceAddress:$sourcePort to client $clientKey (${responseData.size} bytes)")
+                    udpSocket?.send(clientPacket)
+                }
             }
+        } catch (e: Exception) {
+            println("Error handling UDP response: ${e.message}")
+        }
+    }
 
-            targetSocket = Socket().apply {
-                configureSocket(this, isClient = false)
+    /**
+     * Creates SOCKS5 UDP response format
+     */
+    private fun createUdpResponse(targetAddress: String, targetPort: Int, payload: ByteArray): ByteArray {
+        val addressBytes = try {
+            val addr = InetAddress.getByName(targetAddress)
+            if (addr is Inet4Address) {
+                byteArrayOf(0x01) + addr.address // IPv4
+            } else {
+                byteArrayOf(0x04) + addr.address // IPv6
+            }
+        } catch (e: Exception) {
+            // Use domain format
+            val domainBytes = targetAddress.toByteArray()
+            byteArrayOf(0x03, domainBytes.size.toByte()) + domainBytes
+        }
 
-                val address = withContext(Dispatchers.IO) {
-                    try {
-                        java.net.InetAddress.getByName(host)
-                    } catch (e: java.net.UnknownHostException) {
-                        debugLog("[$connectionId] DNS resolution failed for $host: ${e.message}")
-                        throw e
+        val portBytes = byteArrayOf(
+            (targetPort shr 8).toByte(),
+            (targetPort and 0xFF).toByte()
+        )
+
+        // RSV (2 bytes) + FRAG (1 byte) + ATYP + ADDRESS + PORT + DATA
+        return byteArrayOf(0x00, 0x00, 0x00) + addressBytes + portBytes + payload
+    }
+
+    /**
+     * Handles a single client connection including SOCKS5 handshake and request parsing.
+     * @param clientSocket The incoming client socket connection.
+     */
+    private suspend fun handleClient(clientSocket: Socket) {
+        withContext(Dispatchers.IO) {
+            val connectionId = "conn-${connectionCounter.incrementAndGet()}"
+            println("[$connectionId] New client connection from ${clientSocket.inetAddress}")
+            try {
+                val input = clientSocket.getInputStream()
+                val output = clientSocket.getOutputStream()
+
+                // 1. SOCKS5 handshake - 타임아웃 추가
+                withTimeout(5000) { // 5초 타임아웃
+                    val handshakeHeader = ByteArray(2)
+                    if (input.read(handshakeHeader) != 2 || handshakeHeader[0] != 0x05.toByte()) {
+                        println("[$connectionId] Not a SOCKS5 client or handshake too short")
+                        cleanup(clientSocket)
+                        return@withTimeout
+                    }
+                    val nMethods = handshakeHeader[1].toInt() and 0xFF
+                    val methods = ByteArray(nMethods)
+                    if (input.read(methods) != nMethods) {
+                        println("[$connectionId] Could not read all methods")
+                        cleanup(clientSocket)
+                        return@withTimeout
+                    }
+                    // Reply: no authentication
+                    output.write(byteArrayOf(0x05, 0x00))
+                    output.flush()
+                }
+
+                // 2. SOCKS5 request - 타임아웃 추가
+                withTimeout(5000) { // 5초 타임아웃
+                    val reqHeader = ByteArray(4)
+                    if (input.read(reqHeader) != 4) {
+                        println("[$connectionId] Could not read request header")
+                        cleanup(clientSocket)
+                        return@withTimeout
+                    }
+                    val cmd = reqHeader[1]
+                    val atyp = reqHeader[3]
+                    var address = ""
+                    var port = 0
+                    when (atyp.toInt()) {
+                        0x01 -> { // IPv4
+                            val addr = ByteArray(4)
+                            if (input.read(addr) != 4) {
+                                println("[$connectionId] Could not read IPv4 address")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            address = addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
+                        }
+                        0x03 -> { // Domain
+                            val len = input.read()
+                            if (len <= 0) {
+                                println("[$connectionId] Invalid domain length")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            val addr = ByteArray(len)
+                            if (input.read(addr) != len) {
+                                println("[$connectionId] Could not read domain name")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            address = String(addr)
+                        }
+                        0x04 -> { // IPv6
+                            val addr = ByteArray(16)
+                            if (input.read(addr) != 16) {
+                                println("[$connectionId] Could not read IPv6 address")
+                                cleanup(clientSocket)
+                                return@withTimeout
+                            }
+                            address = java.net.InetAddress.getByAddress(addr).hostAddress
+                        }
+                        else -> {
+                            println("[$connectionId] Unsupported address type: $atyp")
+                            cleanup(clientSocket)
+                            return@withTimeout
+                        }
+                    }
+                    val portBytes = ByteArray(2)
+                    if (input.read(portBytes) != 2) {
+                        println("[$connectionId] Could not read port")
+                        cleanup(clientSocket)
+                        return@withTimeout
+                    }
+                    port = ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
+
+                    when (cmd) {
+                        0x01.toByte() -> { // CONNECT
+                            handleConnectStrict(address, port, output, clientSocket, connectionId)
+                        }
+                        0x03.toByte() -> { // UDP ASSOCIATE
+                            handleUdpAssociate(address, port, output, clientSocket, connectionId)
+                        }
+                        else -> {
+                            println("[$connectionId] Unsupported command: $cmd")
+                            val response = byteArrayOf(0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+                            output.write(response)
+                            output.flush()
+                            cleanup(clientSocket)
+                        }
                     }
                 }
 
-                debugLog("[$connectionId] Resolved $host to ${address.hostAddress}")
-                connect(java.net.InetSocketAddress(address, port), connectTimeout)
+            } catch (e: Exception) {
+                println("[$connectionId] Client handling error: ${e.message}")
+                cleanup(clientSocket)
             }
+        }
+    }
 
-            if (targetSocket.isConnected) {
-                debugLog("[$connectionId] Successfully connected to $host:$port")
+    /**
+     * Handles SOCKS5 UDP ASSOCIATE command
+     */
+    private suspend fun handleUdpAssociate(host: String, port: Int, output: OutputStream, clientSocket: Socket, connectionId: String) {
+        withContext(Dispatchers.IO) {
+            try {
+                println("[$connectionId] UDP ASSOCIATE request for $host:$port")
 
-                // Send success response
-                val response = byteArrayOf(0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+                // Create UDP association
+                val clientAddress = clientSocket.inetAddress
+                val udpRelayPort = udpSocket?.localPort ?: 0
+                val udpRelayAddress = serverSocket?.inetAddress ?: InetAddress.getLocalHost()
+
+                val association = UdpAssociation(
+                    clientAddress = clientAddress,
+                    clientPort = port, // Client specified port for UDP
+                    udpRelaySocket = udpSocket!!,
+                    associationId = connectionId
+                )
+
+                val associationKey = "$clientAddress:$port"
+                udpAssociations[associationKey] = association
+
+                println("[$connectionId] Created UDP association: $associationKey -> UDP relay port $udpRelayPort")
+
+                // Send success response with UDP relay address and port
+                val response = ByteArray(10)
+                response[0] = 0x05 // Version
+                response[1] = 0x00 // Success
+                response[2] = 0x00 // Reserved
+                response[3] = 0x01 // IPv4 address type
+
+                // Use localhost for UDP relay
+                val relayAddr = InetAddress.getLoopbackAddress().address
+                System.arraycopy(relayAddr, 0, response, 4, 4)
+
+                // UDP relay port
+                response[8] = (udpRelayPort shr 8).toByte()
+                response[9] = (udpRelayPort and 0xFF).toByte()
+
                 output.write(response)
                 output.flush()
 
-                val connectionKey = "$connectionId-${System.currentTimeMillis()}"
-                val connectionInfo = ConnectionInfo(
-                    clientSocket, targetSocket, System.currentTimeMillis(),
-                    AtomicLong(0), host, port, isWebApp
-                )
-                activeConnections[connectionKey] = connectionInfo
+                println("[$connectionId] UDP ASSOCIATE success response sent. UDP relay on ${InetAddress.getLoopbackAddress().hostAddress}:$udpRelayPort")
 
-                startRelay(connectionInfo, connectionId, connectionKey)
+                // Keep the TCP connection alive to maintain the UDP association
+                launch {
+                    try {
+                        val buffer = ByteArray(1024)
+                        while (isRunning && !clientSocket.isClosed && clientSocket.isConnected) {
+                            val bytesRead = clientSocket.getInputStream().read(buffer)
+                            if (bytesRead == -1) {
+                                println("[$connectionId] TCP connection closed, removing UDP association")
+                                break
+                            }
+                            // Just read and discard to keep connection alive
+                        }
+                    } catch (e: Exception) {
+                        println("[$connectionId] TCP keep-alive error: ${e.message}")
+                    } finally {
+                        udpAssociations.remove(associationKey)
+                        // Clean up target mappings for this client
+                        udpTargetMappings.entries.removeIf { (_, clientKey) -> clientKey == associationKey }
+                        println("[$connectionId] UDP association removed")
+                    }
+                }
+
+            } catch (e: Exception) {
+                println("[$connectionId] UDP ASSOCIATE error: ${e.message}")
+                sendErrorResponse(output, 0x05)
+                cleanup(clientSocket)
+            }
+        }
+    }
+
+    /**
+     * Handles the SOCKS5 CONNECT command and attempts to establish a TCP connection
+     * to the requested remote address and port.
+     * @param host The target hostname or IP address.
+     * @param port The target port number.
+     * @param output Output stream to send SOCKS5 response.
+     * @param clientSocket The client's socket.
+     * @param connectionId A unique connection identifier for logging.
+     */
+    private fun handleConnectStrict(host: String, port: Int, output: OutputStream, clientSocket: Socket, connectionId: String) {
+        var targetSocket: Socket? = null
+        try {
+            println("[$connectionId] Connecting to $host:$port")
+            targetSocket = Socket()
+            targetSocket.keepAlive = false // keep-alive 비활성화
+            targetSocket.tcpNoDelay = true
+            targetSocket.soTimeout = 10000 // 타임아웃 단축
+            targetSocket.receiveBufferSize = 16384 // 버퍼 크기 증가
+            targetSocket.sendBufferSize = 16384
+            targetSocket.connect(java.net.InetSocketAddress(host, port), 5000) // 연결 타임아웃 단축
+
+            if (targetSocket.isConnected) {
+                println("[$connectionId] Successfully connected to $host:$port")
+                val response = byteArrayOf(0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+                output.write(response)
+                output.flush()
+                val connectionKey = "$host:$port-${System.currentTimeMillis()}"
+                activeConnections[connectionKey] = Pair(clientSocket, targetSocket)
+                startRelay(clientSocket, targetSocket, connectionId, connectionKey)
             } else {
-                throw Exception("Connection failed - not connected")
+                throw Exception("Connection failed")
             }
         } catch (e: java.net.ConnectException) {
-            debugLog("[$connectionId] Connection refused: ${e.message}")
+            println("[$connectionId] Connection refused to target: ${e.message}")
             sendErrorResponse(output, 0x05)
             targetSocket?.close()
         } catch (e: java.net.SocketTimeoutException) {
-            debugLog("[$connectionId] Connection timeout: ${e.message}")
+            println("[$connectionId] Connection timeout to target: ${e.message}")
             sendErrorResponse(output, 0x04)
             targetSocket?.close()
         } catch (e: java.net.UnknownHostException) {
-            debugLog("[$connectionId] Unknown host: ${e.message}")
+            println("[$connectionId] Unknown host: ${e.message}")
             sendErrorResponse(output, 0x04)
             targetSocket?.close()
         } catch (e: Exception) {
-            debugLog("[$connectionId] Connection failed: ${e.message}")
-            sendErrorResponse(output, 0x01)
+            println("[$connectionId] Connection failed to target: ${e.message}")
+            sendErrorResponse(output, 0x05)
             targetSocket?.close()
         }
     }
 
-    private fun isWebAppDomain(host: String): Boolean {
-        return webAppDomains.any { domain ->
-            host.equals(domain, ignoreCase = true) ||
-                    host.endsWith(".$domain", ignoreCase = true)
-        }
-    }
-
+    /**
+     * Sends a SOCKS5 error response to the client.
+     * @param output Output stream to write the error response to.
+     * @param errorCode SOCKS5 error code to return.
+     */
     private fun sendErrorResponse(output: OutputStream, errorCode: Byte) {
         try {
             val response = byteArrayOf(0x05, errorCode, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
             output.write(response)
             output.flush()
         } catch (e: Exception) {
-            debugLog("Error sending error response: ${e.message}")
+            println("Error writing failure response: ${e.message}")
         }
     }
 
-    private fun startRelay(connectionInfo: ConnectionInfo, connectionId: String, connectionKey: String) {
+    /**
+     * Parses a SOCKS5 address field from a request.
+     * @param buffer The buffer containing the SOCKS request.
+     * @param addressType The address type byte (IPv4, domain, etc.).
+     * @return A pair of the parsed address and port.
+     */
+    private fun parseAddress(buffer: ByteArray, addressType: Byte): Pair<String, Int> {
+        when (addressType) {
+            0x01.toByte() -> { // IPv4
+                val ip = "${buffer[4].toUByte()}.${buffer[5].toUByte()}.${buffer[6].toUByte()}.${buffer[7].toUByte()}"
+                val port = ((buffer[8].toUByte().toInt() shl 8) or buffer[9].toUByte().toInt())
+                return Pair(ip, port)
+            }
+            0x03.toByte() -> { // Domain name
+                val domainLength = buffer[4].toUByte().toInt()
+                val domain = String(buffer.sliceArray(5 until 5 + domainLength))
+                val port = ((buffer[5 + domainLength].toUByte().toInt() shl 8) or
+                        buffer[6 + domainLength].toUByte().toInt())
+                return Pair(domain, port)
+            }
+            0x04.toByte() -> { // IPv6
+                throw IllegalArgumentException("IPv6 not supported yet")
+            }
+            else -> throw IllegalArgumentException("Unsupported address type: $addressType")
+        }
+    }
+
+    /**
+     * Starts bidirectional data relay between the client and the target server.
+     * @param clientSocket The client socket.
+     * @param targetSocket The target socket.
+     * @param connectionId A unique ID for this connection.
+     * @param connectionKey A key used to track the active connection.
+     */
+    private fun startRelay(clientSocket: Socket, targetSocket: Socket, connectionId: String, connectionKey: String) {
+        // 개별 스코프로 릴레이 작업 격리
         val relayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
         val clientToServerJob = relayScope.launch {
-            relayData(
-                from = connectionInfo.clientSocket.getInputStream(),
-                to = connectionInfo.targetSocket.getOutputStream(),
-                direction = "Client->Server",
-                connectionId = connectionId,
-                connectionInfo = connectionInfo
-            )
+            try {
+                relayData(
+                    from = clientSocket.getInputStream(),
+                    to = targetSocket.getOutputStream(),
+                    direction = "Client->Server",
+                    connectionId = connectionId,
+                    clientSocket = clientSocket,
+                    targetSocket = targetSocket
+                )
+            } catch (e: Exception) {
+                println("[$connectionId] Client->Server relay error: ${e.message}")
+            }
         }
 
         val serverToClientJob = relayScope.launch {
-            relayData(
-                from = connectionInfo.targetSocket.getInputStream(),
-                to = connectionInfo.clientSocket.getOutputStream(),
-                direction = "Server->Client",
-                connectionId = connectionId,
-                connectionInfo = connectionInfo
-            )
+            try {
+                relayData(
+                    from = targetSocket.getInputStream(),
+                    to = clientSocket.getOutputStream(),
+                    direction = "Server->Client",
+                    connectionId = connectionId,
+                    clientSocket = clientSocket,
+                    targetSocket = targetSocket
+                )
+            } catch (e: Exception) {
+                println("[$connectionId] Server->Client relay error: ${e.message}")
+            }
         }
 
+        // 정리 작업을 처리하는 코루틴
         serverScope.launch {
             try {
-                select {
-                    clientToServerJob.onJoin { }
-                    serverToClientJob.onJoin { }
-                }
+                // 둘 중 하나라도 완료되면 연결 종료
+                clientToServerJob.join()
+                serverToClientJob.join()
+            } catch (e: Exception) {
+                println("[$connectionId] Relay monitoring error: ${e.message}")
             } finally {
-                relayScope.cancel()
-                cleanupConnection(connectionInfo, connectionId, connectionKey)
+                println("[$connectionId] Relay completed, cleaning up...")
+                relayScope.cancel() // 릴레이 스코프 취소
+                cleanupConnection(clientSocket, targetSocket, connectionId, connectionKey)
             }
         }
     }
 
+    /**
+     * Performs data relay from one socket to another.
+     * Reads data from input and writes to output until sockets close or an error occurs.
+     * @param from Input stream to read from.
+     * @param to Output stream to write to.
+     * @param direction Description of the data direction (for logging).
+     * @param connectionId Connection ID for debugging/logging.
+     * @param clientSocket The client socket.
+     * @param targetSocket The target socket.
+     */
     private suspend fun relayData(
-        from: InputStream,
-        to: OutputStream,
+        from: java.io.InputStream,
+        to: java.io.OutputStream,
         direction: String,
         connectionId: String,
-        connectionInfo: ConnectionInfo
-    ) = withContext(Dispatchers.IO) {
-        try {
-            // Adaptive buffer size based on connection type
-            val bufferSize = if (connectionInfo.isWebApp) 131072 else 65536 // 128KB for web apps
-            val buffer = ByteArray(bufferSize)
-            var totalBytes = 0L
-            var lastActivityTime = System.currentTimeMillis()
+        clientSocket: Socket,
+        targetSocket: Socket
+    ) {
+        withContext(Dispatchers.IO) {
+            try {
+                val buffer = ByteArray(16384) // 버퍼 크기 증가
+                var totalBytes = 0L
 
-            // Longer idle timeout for web apps
-            val maxIdleTime = if (connectionInfo.isWebApp) 600000 else 300000 // 10min vs 5min
-
-            while (isRunning &&
-                !connectionInfo.clientSocket.isClosed &&
-                !connectionInfo.targetSocket.isClosed &&
-                connectionInfo.clientSocket.isConnected &&
-                connectionInfo.targetSocket.isConnected) {
-
-                try {
-                    val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastActivityTime > maxIdleTime) {
-                        debugLog("[$connectionId] $direction: Idle timeout after ${maxIdleTime/1000}s")
-                        break
-                    }
-
-                    val bytesRead = from.read(buffer)
-                    if (bytesRead == -1) {
-                        debugLog("[$connectionId] $direction: EOF received")
-                        break
-                    }
-
-                    if (bytesRead > 0) {
-                        to.write(buffer, 0, bytesRead)
-                        to.flush()
-                        totalBytes += bytesRead
-                        connectionInfo.bytesTransferred.addAndGet(bytesRead.toLong())
-                        totalBytesTransferred.addAndGet(bytesRead.toLong())
-                        lastActivityTime = currentTime
-
-                        // More frequent logging for web apps
-                        val logThreshold = if (connectionInfo.isWebApp) 512 * 1024 else 1024 * 1024 // 512KB vs 1MB
-                        if (totalBytes % logThreshold == 0L) {
-                            debugLog("[$connectionId] $direction: ${totalBytes / (1024 * 1024)}MB transferred")
+                while (isRunning && serverScope.isActive &&
+                    !clientSocket.isClosed &&
+                    !targetSocket.isClosed &&
+                    clientSocket.isConnected &&
+                    targetSocket.isConnected) {
+                    try {
+                        val bytesRead = from.read(buffer)
+                        if (bytesRead == -1) {
+                            println("[$connectionId] $direction: EOF received, closing connection")
+                            break // EOF 받으면 즉시 연결 종료
                         }
-                    }
-                } catch (e: java.net.SocketTimeoutException) {
-                    // For web apps, continue on timeout instead of breaking
-                    if (connectionInfo.isWebApp) {
-                        continue
-                    } else {
-                        debugLog("[$connectionId] $direction: Socket timeout")
+
+                        if (bytesRead > 0) {
+                            to.write(buffer, 0, bytesRead)
+                            to.flush()
+                            totalBytes += bytesRead
+
+                            // 연결 상태 확인 빈도 줄임
+                            if (totalBytes % 32768 == 0L) {
+                                if (clientSocket.isClosed || targetSocket.isClosed) {
+                                    println("[$connectionId] $direction: Socket closed during transfer")
+                                    break
+                                }
+                            }
+                        }
+                    } catch (e: java.net.SocketTimeoutException) {
+                        // 타임아웃 시 연결 종료
+                        println("[$connectionId] $direction: Read timeout, closing connection")
+                        break
+                    } catch (e: java.net.SocketException) {
+                        if (e.message?.contains("closed") == true ||
+                            e.message?.contains("reset") == true ||
+                            e.message?.contains("Broken pipe") == true) {
+                            println("[$connectionId] $direction: Connection terminated (${e.message})")
+                        } else {
+                            println("[$connectionId] $direction: Network error - ${e.message}")
+                        }
+                        break
+                    } catch (e: java.io.IOException) {
+                        println("[$connectionId] $direction: IO error - ${e.message}")
+                        break
+                    } catch (e: Exception) {
+                        println("[$connectionId] $direction: Unexpected error - ${e.message}")
                         break
                     }
-                } catch (e: java.net.SocketException) {
-                    when {
-                        e.message?.contains("closed") == true ->
-                            debugLog("[$connectionId] $direction: Connection closed gracefully")
-                        e.message?.contains("reset") == true ->
-                            debugLog("[$connectionId] $direction: Connection reset by peer")
-                        e.message?.contains("Broken pipe") == true ->
-                            debugLog("[$connectionId] $direction: Broken pipe")
-                        else ->
-                            debugLog("[$connectionId] $direction: Socket error - ${e.message}")
-                    }
-                    break
-                } catch (e: Exception) {
-                    debugLog("[$connectionId] $direction: Unexpected error - ${e.message}")
-                    break
                 }
-            }
 
-            debugLog("[$connectionId] $direction relay finished. Total bytes: $totalBytes")
-        } catch (e: Exception) {
-            debugLog("[$connectionId] $direction relay error: ${e.message}")
+                println("[$connectionId] $direction relay finished. Total bytes: $totalBytes")
+
+            } catch (e: Exception) {
+                println("[$connectionId] $direction relay fatal error: ${e.message}")
+            }
         }
     }
 
-    private fun cleanupConnection(connectionInfo: ConnectionInfo, connectionId: String, connectionKey: String) {
-        debugLog("[$connectionId] Cleaning up connection...")
+    /**
+     * Cleans up a finished or failed connection by closing sockets and removing tracking info.
+     * @param clientSocket The client socket.
+     * @param targetSocket The target server socket.
+     * @param connectionId A unique connection ID.
+     * @param connectionKey Key used to remove from active connections.
+     */
+    private fun cleanupConnection(clientSocket: Socket, targetSocket: Socket, connectionId: String, connectionKey: String) {
+        println("[$connectionId] Starting connection cleanup...")
 
         activeConnections.remove(connectionKey)
-        clientSockets.remove(connectionInfo.clientSocket)
 
-        val duration = System.currentTimeMillis() - connectionInfo.startTime
-        val bytesTransferred = connectionInfo.bytesTransferred.get()
-
-        debugLog("[$connectionId] Connection to ${connectionInfo.host}:${connectionInfo.port} closed. " +
-                "Duration: ${duration}ms, Bytes: $bytesTransferred, WebApp: ${connectionInfo.isWebApp}")
-
-        listOf(connectionInfo.clientSocket, connectionInfo.targetSocket).forEach { socket ->
-            try {
-                if (!socket.isClosed) {
-                    socket.shutdownInput()
-                    socket.shutdownOutput()
-                    socket.close()
+        // 소켓들을 빠르게 종료
+        try {
+            if (!clientSocket.isClosed) {
+                try {
+                    clientSocket.shutdownOutput()
+                    clientSocket.shutdownInput()
+                } catch (e: Exception) {
+                    // 무시
                 }
-            } catch (e: Exception) {
-                // Ignore cleanup errors
+                clientSocket.close()
             }
+        } catch (e: Exception) {
+            // 무시
         }
+
+        try {
+            if (!targetSocket.isClosed) {
+                try {
+                    targetSocket.shutdownOutput()
+                    targetSocket.shutdownInput()
+                } catch (e: Exception) {
+                    // 무시
+                }
+                targetSocket.close()
+            }
+        } catch (e: Exception) {
+            // 무시
+        }
+
+        clientSockets.remove(clientSocket)
+        println("[$connectionId] Connection cleanup completed")
     }
 
+    /**
+     * Cleans up a single client socket, usually after failed handshake or errors.
+     * @param clientSocket The client socket to close and remove.
+     */
     private fun cleanup(clientSocket: Socket) {
         clientSockets.remove(clientSocket)
         try {
@@ -527,118 +798,114 @@ class EnhancedSocksProxyServer(private val port: Int, private val enableDebugLog
                 clientSocket.close()
             }
         } catch (e: Exception) {
-            // Ignore
+            // 무시
         }
     }
 
-    private fun monitorConnections() {
-        serverScope.launch {
-            while (isRunning) {
-                delay(60000) // Every minute
-                val stats = getConnectionStats()
-                if (enableDebugLog || stats.activeConnections > 0) {
-                    println("=== Connection Monitor ===")
-                    println("Active: ${stats.activeConnections}, Total: ${stats.totalConnections}")
-                    println("WebApp connections: ${stats.webAppConnections}")
-                    println("Total bytes: ${stats.bytesTransferred / (1024 * 1024)}MB")
-                    println("Failed connections: ${stats.failedConnections}")
-
-                    if (activeConnections.isNotEmpty()) {
-                        println("Active connections:")
-                        activeConnections.forEach { (key, info) ->
-                            val duration = (System.currentTimeMillis() - info.startTime) / 1000
-                            val bytes = info.bytesTransferred.get()
-                            println("  - ${info.host}:${info.port} (${duration}s, ${bytes}B, WebApp:${info.isWebApp})")
-                        }
-                    }
-                    println("========================")
-                }
-            }
-        }
-    }
-
-    private fun debugLog(message: String) {
-        if (enableDebugLog) {
-            println("[${dateFormatter.format(Date())}] $message")
-        }
-    }
-
+    /**
+     * Stops the SOCKS proxy server and releases all resources.
+     * Closes all sockets, cancels coroutines, and clears active connections.
+     */
     fun stop() {
-        println("Stopping Enhanced SOCKS proxy server...")
+        println("Stopping SOCKS proxy server...")
         isRunning = false
 
-        activeConnections.values.forEach { connectionInfo ->
+        // UDP associations 정리
+        udpAssociations.clear()
+        udpTargetMappings.clear() // 매핑도 함께 정리
+
+        // 활성 연결들 정리
+        activeConnections.values.forEach { (client, target) ->
             try {
-                connectionInfo.clientSocket.close()
-                connectionInfo.targetSocket.close()
+                client.close()
+                target.close()
             } catch (e: Exception) {
-                // Ignore
+                // 무시
             }
         }
         activeConnections.clear()
 
+        // 클라이언트 소켓들 정리
         clientSockets.forEach { socket ->
-            try { socket.close() } catch (e: Exception) { /* ignore */ }
+            try {
+                socket.close()
+            } catch (e: Exception) {
+                // 무시
+            }
         }
         clientSockets.clear()
 
+        // 서버 소켓 닫기
         try {
             serverSocket?.close()
         } catch (e: Exception) {
-            // Ignore
+            // 무시
         }
 
+        // UDP 소켓 닫기
+        try {
+            udpSocket?.close()
+        } catch (e: Exception) {
+            // 무시
+        }
+
+        // 스코프 취소
         serverScope.cancel()
-        println("Enhanced SOCKS proxy server stopped")
+        println("SOCKS proxy server stopped")
     }
 
-    // Public status methods
-    fun getConnectionCount(): Int = activeConnections.size
-    fun getClientSocketCount(): Int = clientSockets.size
-    fun isServerRunning(): Boolean = isRunning
-    fun getTotalBytesTransferred(): Long = totalBytesTransferred.get()
-
-    private fun getConnectionStats(): ConnectionStats {
-        val webAppCount = activeConnections.values.count { it.isWebApp }
-        return ConnectionStats(
-            totalConnections = connectionCounter.get(),
-            activeConnections = activeConnections.size,
-            webAppConnections = webAppCount,
-            bytesTransferred = totalBytesTransferred.get()
-        )
+    /**
+     * Returns the current number of active SOCKS connections.
+     * @return Active connection count.
+     */
+    fun getConnectionCount(): Int {
+        return activeConnections.size
     }
 
+    /**
+     * Returns the number of UDP associations currently active.
+     * @return Number of UDP associations.
+     */
+    fun getUdpAssociationCount(): Int {
+        return udpAssociations.size
+    }
+
+    /**
+     * Returns the number of client sockets currently managed by the server.
+     * @return Number of client sockets.
+     */
+    fun getClientSocketCount(): Int {
+        return clientSockets.size
+    }
+
+    /**
+     * Returns whether the server is currently running.
+     * @return True if the server is running, false otherwise.
+     */
+    fun isServerRunning(): Boolean {
+        return isRunning
+    }
+
+    /**
+     * Returns the UDP relay port number.
+     * @return UDP relay port, or -1 if not available.
+     */
+    fun getUdpRelayPort(): Int {
+        return udpSocket?.localPort ?: -1
+    }
+
+    /**
+     * Returns a human-readable status of the SOCKS proxy server.
+     * Includes port and connection info if running.
+     * @return Status string.
+     */
     fun getServerStatus(): String {
-        val stats = getConnectionStats()
         return if (isRunning) {
-            "Running on port $port (${stats.activeConnections} active, ${stats.webAppConnections} web apps, ${stats.bytesTransferred / (1024 * 1024)}MB transferred)"
+            val udpPort = getUdpRelayPort()
+            "Running on port $port (${activeConnections.size} TCP connections, ${udpAssociations.size} UDP associations)" +
+                    if (udpPort != -1) ", UDP relay on port $udpPort" else ""
         } else {
             "Stopped"
-        }
-    }
-
-    fun getDetailedStatus(): String {
-        val stats = getConnectionStats()
-        return buildString {
-            appendLine("Enhanced SOCKS5 Proxy Server Status:")
-            appendLine("- Running: $isRunning")
-            appendLine("- Port: $port")
-            appendLine("- Debug logging: $enableDebugLog")
-            appendLine("- Active connections: ${stats.activeConnections}/$maxConnections")
-            appendLine("- Web app connections: ${stats.webAppConnections}")
-            appendLine("- Total connections: ${stats.totalConnections}")
-            appendLine("- Client sockets: ${clientSockets.size}")
-            appendLine("- Total bytes transferred: ${stats.bytesTransferred / (1024 * 1024)}MB")
-
-            if (activeConnections.isNotEmpty()) {
-                appendLine("\nActive Connections:")
-                activeConnections.forEach { (key, info) ->
-                    val duration = System.currentTimeMillis() - info.startTime
-                    val bytes = info.bytesTransferred.get()
-                    appendLine("  - $key: ${info.host}:${info.port}")
-                    appendLine("    Duration: ${duration}ms, Bytes: $bytes, WebApp: ${info.isWebApp}")
-                }
-            }
         }
     }
 }

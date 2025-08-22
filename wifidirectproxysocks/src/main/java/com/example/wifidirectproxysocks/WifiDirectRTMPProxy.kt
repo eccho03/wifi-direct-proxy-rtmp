@@ -205,4 +205,36 @@ class WiFiDirectRTMPProxy(private val context: Context) {
     fun isRunning(): Boolean {
         return isProxyRunning
     }
+
+    /**
+     * Returns the UDP relay port number used by the SOCKS proxy server.
+     * @return UDP relay port, or -1 if not available.
+     */
+    fun getUdpRelayPort(): Int {
+        return socksProxyServer?.getUdpRelayPort() ?: -1
+    }
+
+    /**
+     * Returns the number of active TCP connections.
+     * @return Number of active TCP connections.
+     */
+    fun getConnectionCount(): Int {
+        return socksProxyServer?.getConnectionCount() ?: 0
+    }
+
+    /**
+     * Returns the number of active UDP associations.
+     * @return Number of active UDP associations.
+     */
+    fun getUdpAssociationCount(): Int {
+        return socksProxyServer?.getUdpAssociationCount() ?: 0
+    }
+
+    /**
+     * Returns a detailed status string of the proxy server.
+     * @return Status string including TCP and UDP information.
+     */
+    fun getProxyStatus(): String {
+        return socksProxyServer?.getServerStatus() ?: "Not running"
+    }
 }
