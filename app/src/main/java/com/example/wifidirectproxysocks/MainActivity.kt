@@ -60,7 +60,7 @@ class MainActivity : AppCompatActivity() {
         val granted = perms.values.all { it }
         if (granted) {
             Log.d(TAG, "✅ 권한 모두 허용됨")
-            startWiFiDirectFlow()
+            startNetworkFlow()
             initializeProxy()
         } else {
             Log.e(TAG, "❌ 권한 거부됨")
@@ -297,6 +297,32 @@ class MainActivity : AppCompatActivity() {
             )
         }
     }
+
+    private fun startNetworkFlow() {
+        if (isHotspotEnabled()) {
+            Log.d(TAG, "📶 Hotspot(테더링) 모드 감지됨 → Wi-Fi Direct 초기화 생략")
+            // 바로 프록시 시작 가능 (버튼 누르면 startProxy 호출되도록 이미 되어 있음)
+        } else {
+            Log.d(TAG, "📡 Wi-Fi Direct 모드로 초기화 시작")
+            startWiFiDirectFlow()
+        }
+    }
+
+    /**
+     * 현재 기기가 테더링 중인지 확인
+     */
+    private fun isHotspotEnabled(): Boolean {
+        return try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val method = wifiManager.javaClass.getDeclaredMethod("isWifiApEnabled")
+            method.isAccessible = true
+            method.invoke(wifiManager) as Boolean
+        } catch (e: Exception) {
+            Log.w(TAG, "⚠️ Hotspot 상태 확인 실패", e)
+            false
+        }
+    }
+
 
     private fun startWiFiDirectFlow() {
         resetWifiState {
